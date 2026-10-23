@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 and P1.
+These are checked again at the end of each phase. They have been met for P0, P1 and P2.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -27,8 +27,8 @@ These are checked again at the end of each phase. They have been met for P0 and 
 | Phase | Status | Commit |
 |---|---|---|
 | P0 Scaffold and tooling | ✅ Done | `975ca45` |
-| P1 Simulated environment | ✅ Done | not yet committed |
-| P2 Audit log | ⬜ Not started | |
+| P1 Simulated environment | ✅ Done | `d010efa` (PR #1, merged as `4e81ac6`) |
+| P2 Audit log | ✅ Done | not yet committed |
 | P3 Bundle loading and offline validation | ⬜ Not started | |
 | P4 Kubernetes access layer | ⬜ Not started | |
 | P5 Deploy, happy path | ⬜ Not started | |
@@ -166,32 +166,46 @@ behave as the fault model requires.
 
 ## P2: Audit log
 
+**Status:** ✅ Done
+
 **Goal:** a tamper-evident, append-only audit log that is safe under concurrent writers.
 
 **Deliverables**
 - `deploysim/audit.py`:
-  - `AuditLog(path)` with `append(record) -> AuditRecord`, `records(filter)` and `verify() -> list[Problem]`;
+  - `AuditLog(path, clock)` with `append(Entry) -> AuditRecord`,
+    `records(app=, environment=, deployment_id=)` and `verify() -> list[Problem]`;
   - `append` takes an exclusive `flock`, reads the last `seq` and `hash`, writes one JSON line, then
     flushes and fsyncs;
+  - `append` refuses, with `AuditError`, to chain onto an incomplete last line;
   - `hash = sha256(prev_hash + canonical_json(record_without_hash))`, with a fixed genesis `prev_hash`;
   - `ts` is UTC ISO-8601 with milliseconds.
 
 **Definition of done**
-- [ ] The record fields match the README audit example exactly.
-- [ ] All P2 tests pass.
+- [x] The record fields match the README audit example exactly, checked by
+      `test_record_fields_match_readme`.
+- [x] All P2 tests pass (15 tests, about 0.3 s).
+- [x] Removing the `flock` makes `test_concurrent_appends` fail (3 of 3 runs), so the test guards the
+      lock.
 
 **Tests that must pass** (`tests/unit/test_audit.py`)
 
-| Test | Asserts |
-|---|---|
-| `test_seq_gap_free` | 100 appends give `seq` 1..100 |
-| `test_chain_verifies` | `verify()` returns no problems on an untouched log |
-| `test_detects_edit` | Changing one field in one line is reported at that `seq` |
-| `test_detects_delete` | Removing a middle line is reported as a gap |
-| `test_detects_reorder` | Swapping two lines is reported |
-| `test_detects_truncation_mid_line` | A partial last line is reported, not silently skipped |
-| `test_concurrent_appends` | 8 processes × 50 appends give gap-free `seq` and a valid chain |
-| `test_timestamp_format` | `ts` matches `YYYY-MM-DDTHH:MM:SS.mmmZ` |
+| Test | Asserts | Status |
+|---|---|---|
+| `test_seq_gap_free` | 100 appends give `seq` 1..100 | ✅ |
+| `test_first_record_starts_chain` | First record has `seq` 1 and the genesis `prev_hash` | ✅ |
+| `test_chain_verifies` | `verify()` returns no problems on an untouched log | ✅ |
+| `test_empty_log` | No file means no records and no problems | ✅ |
+| `test_detects_edit` | Changing one field in one line is reported at exactly that line and `seq` | ✅ |
+| `test_detects_delete` | Removing a middle line is reported as a `seq` gap and a broken `prev_hash` | ✅ |
+| `test_detects_reorder` | Swapping two lines is reported | ✅ |
+| `test_detects_truncation_mid_line` | A partial last line is reported, not silently skipped | ✅ |
+| `test_append_refuses_after_incomplete_record` | `append` raises `AuditError` rather than chaining onto a partial line | ✅ |
+| `test_concurrent_appends` | 8 processes, released together, × 50 appends give gap-free `seq`, a valid chain, and each writer's records in order | ✅ |
+| `test_timestamp_format` | `ts` matches `YYYY-MM-DDTHH:MM:SS.mmmZ`; milliseconds are truncated | ✅ |
+| `test_record_fields_match_readme` | Key order in memory and on disk equals the README audit example | ✅ |
+| `test_append_fsyncs` | Every append calls `fsync` | ✅ |
+| `test_records_filter` | Filtering by `app`, `environment` and `deployment_id` | ✅ |
+| `test_unreadable_line_raises_on_records` | `records()` names the file and line of an unreadable record | ✅ |
 
 ---
 
