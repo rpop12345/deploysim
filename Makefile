@@ -41,7 +41,7 @@ KWOK_URL := https://github.com/kubernetes-sigs/kwok/releases/download/$(KWOK_VER
 KUBECTL_URL := https://dl.k8s.io/release/$(KUBE_VERSION)/bin/$(OS)/$(ARCH)/kubectl
 KUBECTL_VALIDATE_URL := https://github.com/kubernetes-sigs/kubectl-validate/releases/download/$(KUBECTL_VALIDATE_VERSION)/kubectl-validate_$(OS)_$(ARCH).tar.gz
 
-.PHONY: help tools install-dev lint fmt test-unit test-e2e test package clean
+.PHONY: help tools cluster-up cluster-down schemas install-dev lint fmt test-unit test-e2e test package clean
 
 help: ## List targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "%-12s %s\n", $$1, $$2}'
@@ -51,6 +51,15 @@ tools: ## Download pinned kwokctl, kwok, kubectl and kubectl-validate into bin/
 	@scripts/install-tool.sh kwok "$(KWOK_URL)/kwok-$(OS)-$(ARCH)" "$(KWOK_SHA256_$(PLATFORM))"
 	@scripts/install-tool.sh kubectl "$(KUBECTL_URL)" "$(KUBECTL_SHA256_$(PLATFORM))"
 	@scripts/install-tool.sh kubectl-validate "$(KUBECTL_VALIDATE_URL)" "$(KUBECTL_VALIDATE_SHA256_$(PLATFORM))" kubectl-validate
+
+cluster-up: tools ## Create or reconcile the KWOK cluster; kubeconfig in .deploysim/
+	@KWOK_VERSION=$(KWOK_VERSION) KWOK_KUBE_VERSION=$(KUBE_VERSION) scripts/cluster-up.sh
+
+cluster-down: ## Delete the KWOK cluster
+	@scripts/cluster-down.sh
+
+schemas: ## Export OpenAPI schemas from the running cluster into schemas/
+	@scripts/export-schemas.sh schemas
 
 install-dev: ## Create .venv with deploysim and dev tools
 	$(PYTHON) -m venv $(VENV)
@@ -73,7 +82,7 @@ test-unit: ## Unit tests; no cluster needed
 test-e2e: ## End-to-end tests; needs make cluster-up
 	$(VBIN)/pytest -m e2e tests/e2e
 
-test: test-unit ## All tests
+test: test-unit test-e2e ## All tests
 
 package: ## Build wheel and sdist into dist/
 	$(VBIN)/python -m build
