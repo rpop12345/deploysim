@@ -50,19 +50,26 @@ P1, P2 and P3 are independent and can be built in any order.
 - `.github/workflows/ci.yml` with `lint` and `unit` jobs only.
 
 **Definition of done**
-- [ ] `make tools` on a clean checkout produces all four binaries; a second run downloads nothing.
-- [ ] Changing one pinned checksum makes `make tools` fail and delete the downloaded file.
-- [ ] `make install-dev lint test-unit` passes.
-- [ ] `deploysim --version` and `python -m deploysim --version` print the package version.
+- [x] `make tools` on a clean checkout produces all four binaries; a second run downloads nothing.
+- [x] Changing one pinned checksum makes `make tools` fail and delete the downloaded file.
+- [x] `make install-dev lint test-unit` passes.
+- [x] `deploysim --version` and `python -m deploysim --version` print the package version, with `.venv`
+      activated.
 - [ ] The CI `lint` and `unit` jobs are green on a pushed commit.
 
 **Tests that must pass**
 
-| Test | Asserts |
-|---|---|
-| `tests/unit/test_smoke.py::test_version` | `deploysim --version` exits 0 and prints `__version__` |
-| `make tools` run twice | Second run makes no network requests |
-| `make tools` with a corrupted checksum | Exits non-zero; no binary left in `bin/` |
+| Test | Asserts | Status |
+|---|---|---|
+| `tests/unit/test_smoke.py::test_version[module]` and `[console-script]` | Both entry points exit 0 and print `deploysim <__version__>` | ✅ |
+| `tests/unit/test_install_tool.py::test_installs_and_stamps` | Binary installed, executable, marker file holds the SHA-256 | ✅ |
+| `tests/unit/test_install_tool.py::test_second_run_downloads_nothing` | Second run with an unreachable URL succeeds silently | ✅ |
+| `tests/unit/test_install_tool.py::test_checksum_mismatch_leaves_no_binary` | Exit 1; neither binary nor marker file remains | ✅ |
+| `tests/unit/test_install_tool.py::test_extracts_tar_member` | The named member is extracted from a `.tar.gz` | ✅ |
+| `tests/unit/test_install_tool.py::test_missing_checksum_fails` | No pinned checksum gives exit 1 and nothing is downloaded | ✅ |
+| `make tools` run twice | Second run makes no network requests | ✅ 0.1 s, no output |
+| `make tools` with a corrupted checksum | Exits non-zero; no binary left in `bin/` | ✅ |
+| CI `lint` and `unit` jobs | Green on GitHub | ⏳ needs a push |
 
 ---
 

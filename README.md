@@ -43,9 +43,10 @@ make cluster-down
 `make cluster-up` writes its kubeconfig to `.deploysim/kubeconfig`. It never reads or modifies
 `~/.kube/config` or changes your current context.
 
-A manual walkthrough:
+A manual walkthrough. `make install-dev` installs `deploysim` into `.venv`, so activate it first:
 
 ```sh
+source .venv/bin/activate
 deploysim validate examples/orders-api-1.0.0.yaml
 deploysim deploy   examples/orders-api-1.0.0.yaml --env dev
 deploysim deploy   examples/orders-api-1.0.0.yaml --env staging

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deploysim"
+dynamic = ["version"]
+description = "Deployment controller that promotes releases through a simulated KWOK environment"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0,<7"]
+
+[project.optional-dependencies]
+dev = [
+  "build==1.6.1",
+  "cyclonedx-bom==7.5.0",
+  "mypy==2.4.0",
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "ruff==0.17.0",
+  "shellcheck-py==0.11.0.1",
+  "types-PyYAML==6.0.12.20260906",
+]
+
+[project.scripts]
+deploysim = "deploysim.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "deploysim.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["deploysim*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "PT", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["deploysim", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+addopts = "-ra --strict-markers"
+markers = ["e2e: needs a running KWOK cluster (make cluster-up)"]
