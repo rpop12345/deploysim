@@ -71,6 +71,13 @@ bin/kubectl --kubeconfig .deploysim/kubeconfig get releases -A
 | `Release` CRD (`crds/release.yaml`) | The release record, with server-side immutability |
 | KWOK Stages (`kwok/stages.yaml`) | Pod lifecycle, including the [fault](#fault-injection) stages |
 
+`make cluster-up` is safe to re-run:
+- A running cluster is reconciled in place.
+- A stopped cluster, for example after a reboot, is recreated empty.
+- A cluster created from different stages or versions is refused, with instructions to recreate it.
+
+Every run ends by checking that a canary pod becomes Ready.
+
 **Safety guard.** deploysim only talks to the cluster in `--kubeconfig` (default
 `.deploysim/kubeconfig`). It ignores `$KUBECONFIG` and `~/.kube/config`. Before any cluster call it
 refuses to continue, with exit code 5, unless the API server address is a loopback address and the
@@ -112,10 +119,6 @@ spec:
         app.kubernetes.io/name: orders-api
         app.kubernetes.io/version: 1.1.0
     spec:
-      tolerations:
-      - key: kwok.x-k8s.io/node
-        operator: Exists
-        effect: NoSchedule
       containers:
       - name: orders-api
         image: registry.example.com/orders-api@sha256:4f9c2e7d1b0a8e6f3c5d2b1a09e8f7c6d5b4a3928170f6e5d4c3b2a1908f7e6d
@@ -233,7 +236,7 @@ Faults come from KWOK Stages that match a pod-template annotation, so the contro
 | `deploysim.io/fault` | KWOK behaviour | Effect |
 |---|---|---|
 | `unhealthy` | Pods run but never become Ready (`CrashLoopBackOff`) | Rollout misses its progress deadline, so the deployment rolls back |
-| `slow-start` | Pods become Ready after a delay | Deployment succeeds after waiting |
+| `slow-start` | Pods become Ready after 5 s | Deployment succeeds after waiting |
 
 The annotation can be set in two places:
 - **In the bundle**, to simulate a broken build. `examples/orders-api-1.2.0.yaml` fails in every
@@ -434,6 +437,7 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 | `tests/unit/test_validate.py` | Every pass-1 rule has a failing fixture in `tests/fixtures/invalid/`; checks that kubectl-validate runs isolated from `$KUBECONFIG` | Invalid input |
 | `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted and reordered lines are detected | Audit-friendly result |
 | `tests/unit/test_cli.py` | Exit codes, summary JSON shape, usage error 64, safety guard refuses a non-loopback server | — |
+| `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; Release CRD name and immutability rules enforced by the API server; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster | The simulated environment |
 | `tests/e2e/test_deploy.py` | First deployment; upgrade; promotion dev → staging → prod; `slow-start` succeeds after waiting; Release, state and audit are correct | Successful deployment |
 | `tests/e2e/test_rejections.py` | Invalid bundle is rejected with zero objects created; promotion gate; version re-used with a different image (rejected by the API server's CEL rule); degraded gate | Invalid input |
 | `tests/e2e/test_rollback.py` | Unhealthy upgrade rolls back to the previous release and old pods keep serving; unhealthy first deployment returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3 | Failed health check, rollback |
@@ -490,8 +494,8 @@ Three details are deliberate:
 - **The CRD gets a server dry run.** kubectl-validate does not validate a CRD definition the way the
   API server does. It accepted a schema the server rejects (`additionalProperties` combined with
   `properties`).
-- **`make tools` downloads every binary by exact version and verifies it against a SHA-256 pinned in
-  the `Makefile`.** CI and laptops run identical tools.
+- **`make tools` downloads kwokctl, kwok, kubectl and kubectl-validate by exact version and verifies
+  each against a SHA-256 pinned in the `Makefile`.** CI and laptops run identical tools.
 
 ### What a production pipeline adds
 
@@ -567,6 +571,9 @@ one names where it would plug into deploysim.
 - **Namespaces stand in for environments.** Production environments would be separate clusters, and
   usually separate cloud accounts.
 - **No pruning.** An object removed from a bundle is left in place by the next deploy.
+- **Control-plane binaries are not checksum-pinned here.** kwokctl downloads kube-apiserver,
+  kube-controller-manager, kube-scheduler and etcd for the pinned Kubernetes version into
+  `~/.kwok/cache` itself. Only the kwok controller comes from the verified `bin/kwok`.
 - **Crash detection waits for Lease expiry.** After a crash, the next run is `LOCKED` for up to
   `--lease-seconds`.
 - **Local audit log.** The hash chain makes tampering detectable, not impossible. Anyone who can

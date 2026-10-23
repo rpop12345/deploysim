@@ -15,10 +15,29 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-- [ ] All tests from earlier phases still pass.
-- [ ] `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
-- [ ] Behaviour matches the README. Where the README is wrong, it is corrected in the same commit.
-- [ ] No step reads or writes `~/.kube/config`.
+These are checked again at the end of each phase. They have been met for P0 and P1.
+
+- All tests from earlier phases still pass.
+- `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
+- Behaviour matches the README. Where the README is wrong, it is corrected in the same commit.
+- No step reads or writes `~/.kube/config`.
+
+## Status
+
+| Phase | Status | Commit |
+|---|---|---|
+| P0 Scaffold and tooling | ✅ Done | `975ca45` |
+| P1 Simulated environment | ✅ Done | not yet committed |
+| P2 Audit log | ⬜ Not started | |
+| P3 Bundle loading and offline validation | ⬜ Not started | |
+| P4 Kubernetes access layer | ⬜ Not started | |
+| P5 Deploy, happy path | ⬜ Not started | |
+| P6 Rollback and degraded environments | ⬜ Not started | |
+| P7 Idempotency, drift and retries | ⬜ Not started | |
+| P8 Crash recovery | ⬜ Not started | |
+| P9 CLI completeness and demo | ⬜ Not started | |
+| P10 CI complete | ⬜ Not started | |
+| P11 Documentation pass | ⬜ Not started | |
 
 ## Phase overview
 
@@ -33,6 +52,8 @@ P1, P2 and P3 are independent and can be built in any order.
 ---
 
 ## P0: Scaffold and tooling
+
+**Status:** ✅ Done
 
 **Goal:** a repository that installs, lints, tests and fetches pinned tools reproducibly.
 
@@ -55,7 +76,7 @@ P1, P2 and P3 are independent and can be built in any order.
 - [x] `make install-dev lint test-unit` passes.
 - [x] `deploysim --version` and `python -m deploysim --version` print the package version, with `.venv`
       activated.
-- [ ] The CI `lint` and `unit` jobs are green on a pushed commit.
+- [x] The CI `lint` and `unit` jobs are green on a pushed commit.
 
 **Tests that must pass**
 
@@ -69,11 +90,13 @@ P1, P2 and P3 are independent and can be built in any order.
 | `tests/unit/test_install_tool.py::test_missing_checksum_fails` | No pinned checksum gives exit 1 and nothing is downloaded | ✅ |
 | `make tools` run twice | Second run makes no network requests | ✅ 0.1 s, no output |
 | `make tools` with a corrupted checksum | Exits non-zero; no binary left in `bin/` | ✅ |
-| CI `lint` and `unit` jobs | Green on GitHub | ⏳ needs a push |
+| CI `lint` and `unit` jobs | Green on GitHub | ✅ `975ca45` |
 
 ---
 
 ## P1: Simulated environment
+
+**Status:** ✅ Done
 
 **Goal:** `make cluster-up` produces the environment the README describes, and the KWOK Stages
 behave as the fault model requires.
@@ -89,16 +112,23 @@ behave as the fault model requires.
 - `kwok/stages.yaml`, holding the complete stage set, because custom stages replace KWOK's defaults:
   - `node-initialize` and `node-heartbeat-with-lease`;
   - `pod-ready`, which skips pods carrying `deploysim.io/fault`;
-  - `pod-slow-start`, which becomes Ready after a delay;
+  - `pod-slow-start`, which becomes Ready after 5 s;
   - `pod-unhealthy`, which runs but never becomes Ready;
   - `pod-delete`.
 - `scripts/cluster-up.sh`, which runs in this order:
-  1. Create the cluster `deploysim` (binary runtime) with its kubeconfig at `.deploysim/kubeconfig`.
-  2. Create 3 nodes.
+  1. Create the cluster `deploysim` (binary runtime, kwok controller from `bin/kwok`) with its
+     kubeconfig at `.deploysim/kubeconfig`.
+  2. Create 3 untainted nodes (`kwok/cluster.yaml`).
   3. Create namespaces `dev`, `staging` and `prod`, labelled `deploysim.io/simulator=true`.
   4. Apply the CRD and wait for it to be established.
+  5. Check that a canary pod becomes Ready within 30 s.
 
-  When the cluster already exists, it only reconciles steps 2–4.
+  When the cluster already exists, step 1 depends on its state:
+  - **Running:** reconcile only.
+  - **Stopped:** recreate it empty, because a restarted KWOK v0.8.0 kwok-controller intermittently
+    stops managing pods.
+  - **Created from different stages or versions:** refuse. This is checked against
+    `.deploysim/cluster.fingerprint`.
 - `scripts/cluster-down.sh`.
 - `scripts/export-schemas.sh` and `make schemas`, writing `schemas/api/v1.json` and
   `schemas/apis/apps/v1.json`, committed to the repo.
@@ -109,24 +139,28 @@ behave as the fault model requires.
   - a `kubectl` fixture bound to `.deploysim/kubeconfig`.
 
 **Definition of done**
-- [ ] `make cluster-up` from nothing finishes in under 60 s with binaries cached; a second run changes nothing.
-- [ ] The SHA-256 of `~/.kube/config` is identical before and after `cluster-up` and `cluster-down`.
-- [ ] `make cluster-down` removes the cluster and `.deploysim/kubeconfig`.
-- [ ] All P1 tests pass.
+- [x] `make cluster-up` from nothing finishes in under 60 s with binaries cached; a second run changes
+      nothing. Measured at 4.9 s fresh and 1.1 s on re-run; namespace and CRD resourceVersions unchanged.
+- [x] The SHA-256 of `~/.kube/config` is identical before and after `cluster-up` and `cluster-down`.
+- [x] `make cluster-down` removes the cluster and `.deploysim/kubeconfig`; with no cluster, it says so
+      and exits 0.
+- [x] A stopped cluster is recreated by `make cluster-up` (3 of 3 stop and up cycles passed).
+- [x] With no cluster, `make test-e2e` exits 1 with "run make cluster-up".
+- [x] All P1 tests pass (two consecutive green runs of `make test`; e2e suite about 13 s).
 
 **Tests that must pass** (`tests/e2e/test_environment.py`)
 
-| Test | Asserts |
-|---|---|
-| `test_nodes_ready` | 3 nodes, all `Ready=True` |
-| `test_environment_namespaces` | `dev`, `staging`, `prod` exist with `deploysim.io/simulator=true` |
-| `test_release_name_rule` | Server rejects a Release whose name ≠ `<app>-<version>` |
-| `test_release_spec_immutable` | Re-applying a Release with a different `image` is rejected with the CEL message |
-| `test_release_status_subresource` | Status patch persists `phase`; printer columns show it |
-| `test_stage_ready` | A plain Deployment completes its rollout in under 10 s |
-| `test_stage_unhealthy` | `deploysim.io/fault: unhealthy` leads to `Progressing=False, ProgressDeadlineExceeded` within `progressDeadlineSeconds + 5 s` |
-| `test_stage_slow_start` | `slow-start` pods are not Ready at 1 s and are Ready after the configured delay |
-| `test_schemas_current` | Freshly exported schemas are byte-identical to `schemas/` |
+| Test | Asserts | Status |
+|---|---|---|
+| `test_nodes_ready` | 3 nodes, all `Ready=True` | ✅ |
+| `test_environment_namespaces` | `dev`, `staging`, `prod` exist with `deploysim.io/simulator=true` | ✅ |
+| `test_release_name_rule` | Server rejects a Release whose name ≠ `<app>-<version>` | ✅ |
+| `test_release_spec_immutable` | Re-applying the identical Release succeeds; a different `image` is rejected with the CEL message | ✅ |
+| `test_release_status_subresource` | Status patch persists `phase` and `attempts`; printer columns show them | ✅ |
+| `test_stage_ready` | A plain 3-replica Deployment completes its rollout in under 10 s | ✅ |
+| `test_stage_unhealthy` | `deploysim.io/fault: unhealthy` leads to `Progressing=False, ProgressDeadlineExceeded` within `progressDeadlineSeconds + 5 s`; pod `Running`, not Ready, `CrashLoopBackOff` | ✅ |
+| `test_stage_slow_start` | `slow-start` pods are not Ready at 1 s, and are Ready after the delay read from `kwok/stages.yaml` | ✅ |
+| `test_schemas_current` | Freshly exported schemas are byte-identical to `schemas/` | ✅ |
 
 ---
 
@@ -457,7 +491,7 @@ them all.
 **Goal:** the README describes the system as built.
 
 **Deliverables**
-- The README tests table includes `test_environment.py`, `test_kube.py`, `test_controller.py` and
+- The README tests table includes `test_kube.py`, `test_controller.py` and
   `test_readme.py`.
 - `--inject-fault` lists the crash points added in P8.
 - Example outputs (summary, audit line, state, `kubectl get releases`) are replaced with real output
