@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0, P1 and P2.
+These are checked again at the end of each phase. They have been met for P0 to P3.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -28,8 +28,8 @@ These are checked again at the end of each phase. They have been met for P0, P1 
 |---|---|---|
 | P0 Scaffold and tooling | ✅ Done | `975ca45` |
 | P1 Simulated environment | ✅ Done | `d010efa` (PR #1, merged as `4e81ac6`) |
-| P2 Audit log | ✅ Done | not yet committed |
-| P3 Bundle loading and offline validation | ⬜ Not started | |
+| P2 Audit log | ✅ Done | `a01f40f` (PR #2, merged as `712c753`) |
+| P3 Bundle loading and offline validation | ✅ Done | not yet committed |
 | P4 Kubernetes access layer | ⬜ Not started | |
 | P5 Deploy, happy path | ⬜ Not started | |
 | P6 Rollback and degraded environments | ⬜ Not started | |
@@ -211,44 +211,60 @@ behave as the fault model requires.
 
 ## P3: Bundle loading and offline validation (pass 1)
 
+**Status:** ✅ Done
+
 **Goal:** `deploysim validate` rejects every invalid bundle listed in the README, with no cluster
 access.
 
 **Deliverables**
+- `deploysim/paths.py`: project root (`$DEPLOYSIM_ROOT` or the current directory), and the paths to
+  `bin/`, `schemas/`, `crds/` and `.deploysim/` under it.
 - `deploysim/bundle.py`:
-  - load multi-document YAML into `Bundle(release, objects)`;
-  - a canonical serialisation and its `bundle_digest`;
-  - policy rules, each with a stable ID: `ONE_RELEASE`, `HAS_DEPLOYMENT`, `KIND_ALLOWED`,
-    `NO_NAMESPACE`, `NAME_LABEL`, `VERSION_LABEL`, `IMAGE_DIGEST`, `IMAGE_MATCHES_RELEASE`,
-    `READINESS_PROBE`, `PROGRESS_DEADLINE`.
+  - parse multi-document YAML, keeping empty documents so positions match kubectl-validate's output;
+  - structure checks (before the schema): `EMPTY`, `NOT_AN_OBJECT`, `ONE_RELEASE`,
+    `HAS_DEPLOYMENT`, `KIND_ALLOWED`;
+  - `Bundle(release, objects)`, whose `digest` ignores document order, key order and YAML style;
+  - policy rules (after the schema): `NO_NAMESPACE`, `NAME_LABEL`, `VERSION_LABEL`, `IMAGE_DIGEST`,
+    `IMAGE_MATCHES_RELEASE` (container named `<app>`), `READINESS_PROBE`, `PROGRESS_DEADLINE`
+    (unset counts as 600).
 - `deploysim/validate.py`:
-  - runs `kubectl-validate -o json --local-schemas schemas/ --local-crds crds/` with
+  - layers file, YAML, structure, schema, policy; the first failing layer ends validation;
+  - runs `kubectl-validate --output json --local-schemas schemas/ --local-crds crds/` with
     `KUBECONFIG=/dev/null`;
-  - maps each failure to a `Violation(source, document, field, message)`;
-  - a missing binary raises `ToolMissing`, which becomes exit code 5.
-- `deploysim validate FILE` prints a JSON result, exits 0 or 1, and writes one audit record.
+  - maps each failure to `Violation(source, code, document, message)`. Unnamed documents are
+    identified by position, and a CEL rule on the whole object is reported as `(root)`;
+  - a missing binary, `schemas/` or `crds/` raises `ToolError`, which becomes exit code 5.
+- `deploysim validate FILE`: JSON on stdout, `REJECTED` lines on stderr, exit 0, 1 or 5, and one
+  audit record. `ExitCode` holds every exit code from the README.
 - `examples/orders-api-1.0.0.yaml`, `examples/orders-api-1.1.0.yaml`, and
-  `examples/orders-api-1.2.0.yaml` (with the `unhealthy` fault annotation).
-- `tests/fixtures/invalid/*.yaml`: one file per rule. Each starts with a header line
-  `# expect: <source>:<rule-or-field>`.
+  `examples/orders-api-1.2.0.yaml` (with the `unhealthy` fault annotation). Each has a ConfigMap,
+  Deployment and Service.
+- `tests/fixtures/invalid/*.yaml`: 23 files, each one mutation of a valid bundle. Each starts with
+  a description line and `# expect: <source>:<code>`.
+- CI `unit` job: runs `make tools`, with `bin/` cached.
 
 **Definition of done**
-- [ ] Every file in `examples/` passes.
-- [ ] Every fixture fails with exactly the violation its header names.
-- [ ] Validation passes with no cluster running, and with `KUBECONFIG` pointing at an unreachable or
-      hostile kubeconfig.
-- [ ] Validating one bundle takes under 2 s.
-- [ ] All P3 tests pass.
+- [x] Every file in `examples/` passes, and so does the README's example bundle.
+- [x] Every fixture fails with exactly the violations its header names, no more and no fewer.
+- [x] Validation passes with no cluster running, and with both `KUBECONFIG` and `~/.kube/config`
+      pointing at a hostile kubeconfig. A control in the same test shows that kubectl-validate,
+      unisolated, does run that kubeconfig's credential plugin.
+- [x] Validating one bundle takes under 2 s (about 0.1 s measured).
+- [x] All P3 tests pass (33 in `test_validate.py`; 55 unit tests in about 5 s).
 
 **Tests that must pass** (`tests/unit/test_validate.py`)
 
-| Test | Asserts |
-|---|---|
-| `test_examples_valid[*]` | Each example gives exit 0 and no violations |
-| `test_invalid_fixture[*]` | Parametrised over `tests/fixtures/invalid/`: exit 1, and the expected violation is present. Fixtures cover: unknown field, wrong type, malformed YAML, empty file, bad semver, tag instead of digest, name ≠ `<app>-<version>` (CEL), timeout out of range, zero or two Releases, no Deployment, a `Secret` (kind not allowed), `metadata.namespace` set, missing labels, sidecar image not pinned, app image ≠ Release image, missing `readinessProbe`, `progressDeadlineSeconds` > timeout |
-| `test_isolated_from_kubeconfig` | With `KUBECONFIG` set to a kubeconfig whose exec plugin writes a marker file, validation succeeds and the marker is never created |
-| `test_bundle_digest_stable` | Key order and whitespace changes give the same digest; a value change does not |
-| `test_tool_missing` | With `kubectl-validate` absent from `bin/`, `validate` exits 5 |
+| Test | Asserts | Status |
+|---|---|---|
+| `test_examples_valid[*]` | Each of the 3 examples has no violations and yields a `Bundle` | ✅ |
+| `test_invalid_fixture[*]` | 23 fixtures; the set of violation keys equals the header's `# expect:` set. Covered: unknown field, wrong type, missing required field, malformed YAML, empty file, bad semver, tag instead of digest, name ≠ `<app>-<version>` (CEL), timeout out of range, zero or two Releases, no Deployment, a `Secret`, a non-map document, `metadata.namespace` set, missing name or version label, sidecar not pinned, app image ≠ Release image, no app container, missing `readinessProbe`, `progressDeadlineSeconds` too long or unset | ✅ |
+| `test_isolated_from_kubeconfig` | With `KUBECONFIG` and `HOME` pointing at a kubeconfig whose exec plugin writes a marker file: the control run creates it, and deploysim's validation never does | ✅ |
+| `test_bundle_digest_stable` | Document order, key order and YAML style give the same digest; changing `replicas` does not | ✅ |
+| `test_validation_time` | One bundle validates in under 2 s | ✅ |
+| `test_missing_file` | A missing file gives `file:READ` | ✅ |
+| `test_cli_valid` | Exit 0, `VALID` JSON with release and digest, one `VALIDATE`/`OK` audit record carrying the kubectl-validate `cmd` | ✅ |
+| `test_cli_rejected` | Exit 1, `REJECTED` JSON, stderr line, audit record listing the violation | ✅ |
+| `test_tool_missing` | With an empty project root: exit 5, `ENVIRONMENT_ERROR`, "run make tools", audit record `ERROR` | ✅ |
 
 ---
 

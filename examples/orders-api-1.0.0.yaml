@@ -1,0 +1,64 @@
+# orders-api 1.0.0: healthy release.
+apiVersion: deploysim.io/v1alpha1
+kind: Release
+metadata:
+  name: orders-api-1.0.0
+spec:
+  app: orders-api
+  version: 1.0.0
+  image: registry.example.com/orders-api@sha256:60721df325892970d02392ff6de5b353f71146cd60b3707184b8d2ec58ba449b
+  healthCheck:
+    timeoutSeconds: 60
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-api-config
+  labels:
+    app.kubernetes.io/name: orders-api
+data:
+  LOG_LEVEL: info
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  labels:
+    app.kubernetes.io/name: orders-api
+spec:
+  replicas: 3
+  progressDeadlineSeconds: 45
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orders-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orders-api
+        app.kubernetes.io/version: 1.0.0
+    spec:
+      containers:
+      - name: orders-api
+        image: registry.example.com/orders-api@sha256:60721df325892970d02392ff6de5b353f71146cd60b3707184b8d2ec58ba449b
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - configMapRef:
+            name: orders-api-config
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  labels:
+    app.kubernetes.io/name: orders-api
+spec:
+  selector:
+    app.kubernetes.io/name: orders-api
+  ports:
+  - port: 80
+    targetPort: 8080
