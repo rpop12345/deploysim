@@ -365,6 +365,8 @@ Each record is flushed and fsynced before the next action starts.
 - `cmd` is the exact command run, so an operator can replay or inspect any step by hand.
 - `hash` is `sha256(prev_hash + record)`, so editing or deleting any line breaks `history --verify`.
 - Appends take an exclusive file lock, so concurrent runs for different apps never interleave records.
+- If the last line is incomplete, for example after a power loss mid-write, appends stop with an
+  error instead of chaining onto it. `history --verify` shows the damaged line.
 
 ### Exit codes
 
@@ -435,7 +437,7 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 | File | Scenarios | Brief requirement |
 |---|---|---|
 | `tests/unit/test_validate.py` | Every pass-1 rule has a failing fixture in `tests/fixtures/invalid/`; checks that kubectl-validate runs isolated from `$KUBECONFIG` | Invalid input |
-| `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted and reordered lines are detected | Audit-friendly result |
+| `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted, reordered and truncated lines are detected; 8 concurrent writers produce one valid chain; every append is fsynced; record fields match this README | Audit-friendly result |
 | `tests/unit/test_cli.py` | Exit codes, summary JSON shape, usage error 64, safety guard refuses a non-loopback server | — |
 | `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; Release CRD name and immutability rules enforced by the API server; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster | The simulated environment |
 | `tests/e2e/test_deploy.py` | First deployment; upgrade; promotion dev → staging → prod; `slow-start` succeeds after waiting; Release, state and audit are correct | Successful deployment |
