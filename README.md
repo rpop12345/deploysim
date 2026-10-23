@@ -147,25 +147,58 @@ run as `REJECTED` (exit 1).
 ### Pass 1: offline, no lock, no cluster access
 
 This pass also runs on its own as `deploysim validate`, which is how CI checks a release on a pull
-request.
+request. The layers run in order, and the first one that fails ends validation, so every violation
+reported belongs to one layer. Each violation is reported as `<source>:<code>`.
 
-| Check | Tool | Catches |
-|---|---|---|
-| Schema | `kubectl-validate` with `--local-schemas schemas/ --local-crds crds/` and `KUBECONFIG=/dev/null` | Unknown fields (`replica:` for `replicas:`), wrong types, missing required fields |
-| Release rules | `kubectl-validate`, using the CRD's OpenAPI schema and CEL rules | `version` not semver; `image` not pinned by `@sha256:` digest; `metadata.name` not `<app>-<version>`; `healthCheck.timeoutSeconds` outside 5–600 |
-| Bundle policy | deploysim | Rules that span documents, listed below |
+| Layer | Tool | Catches | Reported as |
+|---|---|---|---|
+| File | deploysim | Unreadable file | `file:READ` |
+| YAML | PyYAML | Unparseable YAML | `yaml:PARSE` |
+| Structure | deploysim | No documents; a document that is not a map; anything but exactly one `Release`; no `Deployment`; kinds other than apps/v1 `Deployment`, v1 `Service`, v1 `ConfigMap` | `bundle:EMPTY`, `bundle:NOT_AN_OBJECT`, `bundle:ONE_RELEASE`, `bundle:HAS_DEPLOYMENT`, `bundle:KIND_ALLOWED` |
+| Schema | `kubectl-validate` with `--local-schemas schemas/ --local-crds crds/` and `KUBECONFIG=/dev/null` | Unknown fields (`replica:` for `replicas:`), wrong types, missing required fields | `kubectl-validate:<field>`, e.g. `kubectl-validate:spec.replica` |
+| Release rules | `kubectl-validate`, using the CRD's OpenAPI schema and CEL rules | `version` not semver; `image` not pinned by `@sha256:` digest; `healthCheck.timeoutSeconds` outside 5–600; `metadata.name` not `<app>-<version>` | `kubectl-validate:spec.version`, `kubectl-validate:spec.image`, `kubectl-validate:spec.healthCheck.timeoutSeconds`, and `kubectl-validate:(root)` for the name rule |
+| Bundle policy | deploysim | Rules that span documents, listed below | `bundle:<RULE>` |
 
 Bundle policy, the rules a per-document schema cannot express:
 
-- Exactly one `Release` and at least one `Deployment`. Only the kinds `Deployment`, `Service` and
-  `ConfigMap` are allowed.
-- No object sets `metadata.namespace`. deploysim assigns the environment's namespace.
-- Every object is labelled `app.kubernetes.io/name: <app>`. Every Deployment's pod template is
-  labelled `app.kubernetes.io/version: <version>`.
-- Every container image is pinned by digest, and the app container's image equals `Release.spec.image`.
-- Every container has a `readinessProbe`. Without one, "Ready" says nothing about health.
-- `progressDeadlineSeconds` ≤ `healthCheck.timeoutSeconds`, so Kubernetes declares a stuck rollout
-  failed before deploysim stops waiting.
+| Rule | Requires |
+|---|---|
+| `NO_NAMESPACE` | No object sets `metadata.namespace`. deploysim assigns the environment's namespace. |
+| `NAME_LABEL` | Every workload object is labelled `app.kubernetes.io/name: <app>`. |
+| `VERSION_LABEL` | Every Deployment's pod template is labelled `app.kubernetes.io/version: <version>`. |
+| `IMAGE_DIGEST` | Every container and init container image is pinned by `@sha256:` digest. |
+| `IMAGE_MATCHES_RELEASE` | Every Deployment has a container named `<app>`, running exactly `Release.spec.image`. |
+| `READINESS_PROBE` | Every container has a `readinessProbe`. Without one, "Ready" says nothing about health. |
+| `PROGRESS_DEADLINE` | `progressDeadlineSeconds` ≤ `healthCheck.timeoutSeconds`, so Kubernetes declares a stuck rollout failed before deploysim stops waiting. Unset counts as Kubernetes' default of 600. |
+
+Each rule has an invalid example in `tests/fixtures/invalid/`, whose header names the violation it
+must produce. kubectl-validate takes about 0.1 s per bundle.
+
+```
+$ deploysim validate tests/fixtures/invalid/unknown-field.yaml
+REJECTED Deployment/orders-api: kubectl-validate:spec.replica: Invalid value: value provided for unknown field
+{
+  "file": "tests/fixtures/invalid/unknown-field.yaml",
+  "result": "REJECTED",
+  "release": null,
+  "bundle_digest": null,
+  "violations": [
+    {
+      "source": "kubectl-validate",
+      "code": "spec.replica",
+      "document": "Deployment/orders-api",
+      "message": "Invalid value: value provided for unknown field"
+    }
+  ]
+}
+```
+
+The JSON goes to stdout; the `REJECTED` lines go to stderr. Exit codes:
+- 0 for `VALID`;
+- 1 for `REJECTED`;
+- 5 when kubectl-validate, `schemas/` or `crds/` is missing.
+
+Every run appends one `VALIDATE` record to the audit log.
 
 Two details matter here:
 - **Schema parity.** `schemas/` is exported from the KWOK cluster's own OpenAPI endpoint
@@ -174,7 +207,9 @@ Two details matter here:
   any other version from GitHub at run time. Exported schemas avoid both problems. CI checks that
   `schemas/` still matches the cluster.
 - **Isolation.** Without `KUBECONFIG=/dev/null`, kubectl-validate contacts your current kube context
-  to look up schemas. deploysim always runs it isolated, so validation cannot reach a real cluster.
+  to look up schemas. That includes running its credential plugin, such as `aws eks get-token`.
+  deploysim always runs it isolated, so validation cannot reach a real cluster.
+  `test_isolated_from_kubeconfig` proves this with a kubeconfig whose plugin leaves a marker file.
 
 ### Pass 2: against the target environment, while holding the lock
 
@@ -308,6 +343,9 @@ These options apply to every command:
 - `--kubeconfig` (default `.deploysim/kubeconfig`)
 - `--audit-log` (default `.deploysim/audit.jsonl`)
 
+Relative defaults, along with `bin/`, `schemas/` and `crds/`, resolve from the project root. The
+project root is the current directory, or `$DEPLOYSIM_ROOT` when set.
+
 What each command does:
 - `validate` runs pass 1 only. It needs no cluster.
 - `deploy` runs the full pipeline. It prints a JSON summary on stdout and progress lines on stderr.
@@ -431,12 +469,12 @@ make test-e2e    # needs `make cluster-up`
 make test        # both, coverage gate 85%
 ```
 
-Unit tests run in about a second. End-to-end tests each use a unique app name, so they share one
+Unit tests run in about 5 seconds, most of it kubectl-validate. End-to-end tests each use a unique app name, so they share one
 cluster without interfering, and a short `progressDeadlineSeconds` so the failure cases take seconds.
 
 | File | Scenarios | Brief requirement |
 |---|---|---|
-| `tests/unit/test_validate.py` | Every pass-1 rule has a failing fixture in `tests/fixtures/invalid/`; checks that kubectl-validate runs isolated from `$KUBECONFIG` | Invalid input |
+| `tests/unit/test_validate.py` | Every example passes; each of the 23 fixtures in `tests/fixtures/invalid/` produces exactly the violations its header names; kubectl-validate never runs a hostile kubeconfig's credential plugin (with a control showing it would, unisolated); the bundle digest ignores order and formatting; `validate` exit codes, JSON and audit record | Invalid input |
 | `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted, reordered and truncated lines are detected; 8 concurrent writers produce one valid chain; every append is fsynced; record fields match this README | Audit-friendly result |
 | `tests/unit/test_cli.py` | Exit codes, summary JSON shape, usage error 64, safety guard refuses a non-loopback server | — |
 | `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; Release CRD name and immutability rules enforced by the API server; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster | The simulated environment |
@@ -452,8 +490,9 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 deploysim/
   __main__.py      CLI entry point (python -m deploysim)
   cli.py           argument parsing, exit codes, output
-  bundle.py        loading release bundles, bundle policy
-  validate.py      kubectl-validate (offline) and server dry run
+  paths.py         project root and the tool, schema and state paths under it
+  bundle.py        loading release bundles, structure checks, bundle policy, bundle digest
+  validate.py      pass 1: kubectl-validate offline, then bundle policy
   kube.py          kubectl wrapper and safety guard
   lease.py         Lease acquire, renew, takeover, release
   state.py         state ConfigMap with compare-and-swap

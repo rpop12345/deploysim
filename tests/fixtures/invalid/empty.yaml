@@ -1,0 +1,4 @@
+# No documents, only comments.
+# expect: bundle:EMPTY
+# nothing here
+---
