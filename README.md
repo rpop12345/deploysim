@@ -79,9 +79,13 @@ bin/kubectl --kubeconfig .deploysim/kubeconfig get releases -A
 Every run ends by checking that a canary pod becomes Ready.
 
 **Safety guard.** deploysim only talks to the cluster in `--kubeconfig` (default
-`.deploysim/kubeconfig`). It ignores `$KUBECONFIG` and `~/.kube/config`. Before any cluster call it
-refuses to continue, with exit code 5, unless the API server address is a loopback address and the
-target namespace carries the `deploysim.io/simulator=true` label.
+`.deploysim/kubeconfig`). Every kubectl call passes that file as `--kubeconfig` and as
+`$KUBECONFIG`, so `~/.kube/config` is never read. Before any cluster call, deploysim refuses to
+continue, with exit code 5, unless both of these hold:
+- the current context's API server is on loopback (`127.0.0.1`, `::1` or `localhost`);
+- the target namespace exists and carries the `deploysim.io/simulator=true` label.
+
+`deploysim/kube.py` is the only module that runs kubectl, and a unit test enforces that.
 
 ## Release bundle
 
@@ -425,7 +429,7 @@ out". Re-running a command is always safe.
 
 | Situation when `deploy` runs | Result |
 |---|---|
-| Target is current, `kubectl diff` shows no drift, and the rollout is healthy | `NO_OP`, exit 0, recorded in the audit log |
+| Target is current, applying its bundle would change nothing (see below), and the rollout is healthy | `NO_OP`, exit 0, recorded in the audit log |
 | Target is current but has drifted or is unhealthy | Re-applied and verified. The summary marks `"drift_corrected": true`. |
 | A different release is current | Normal deployment |
 | This release was previously rolled back | Deploys again as attempt N+1. Transient failures are common, and the attempt count shows in the Release status and the audit log. |
@@ -443,6 +447,19 @@ defined recovery path.
 
 A crashed run holds its Lease until it expires (`--lease-seconds`, default 30), so the next run reports
 `LOCKED` until then. That is the price of telling a dead run from a slow one without asking it.
+
+**Drift detection.** "Would applying this bundle change anything?" is answered by comparing each
+live object with a server-side dry-run apply. The comparison ignores `.status` and
+`managedFields`, and is made only when the two reads have the same `resourceVersion`.
+- When a controller wrote in between, the check is retried, up to 5 times.
+- An object that keeps changing counts as drift. Re-applying it is harmless.
+- Only fields the bundle sets count. Changing one, such as `replicas` or ConfigMap `data`, is drift.
+  A field someone else added, such as an extra label, is not, because server-side apply leaves it
+  alone.
+
+Plain `kubectl diff` can't be used for this. Straight after an apply, it reported changes in 2 of
+15 runs: status updates, and the `deployment.kubernetes.io/revision` annotation that the Deployment
+controller adds a moment after creation.
 
 ## Design decisions
 
@@ -477,6 +494,8 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 | `tests/unit/test_validate.py` | Every example passes; each of the 23 fixtures in `tests/fixtures/invalid/` produces exactly the violations its header names; kubectl-validate never runs a hostile kubeconfig's credential plugin (with a control showing it would, unisolated); the bundle digest ignores order and formatting; `validate` exit codes, JSON and audit record | Invalid input |
 | `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted, reordered and truncated lines are detected; 8 concurrent writers produce one valid chain; every append is fsynced; record fields match this README | Audit-friendly result |
 | `tests/unit/test_cli.py` | Exit codes, summary JSON shape, usage error 64, safety guard refuses a non-loopback server | — |
+| `tests/unit/test_kube.py` | The safety guard refuses a remote server, a missing kubeconfig, or an unknown context, before any process runs; every call pins `--kubeconfig` and `$KUBECONFIG`; recorded kubectl errors are classified correctly; only `kube.py` and `validate.py` start processes | Never touch a real environment |
+| `tests/e2e/test_kube.py` | An unlabelled or missing namespace is refused; a Lease is exclusive, renewable, released and taken over after expiry; a stale holder's renew and release fail with `Conflict`; state round-trips and a stale save fails with `Conflict`; drift sees real changes and never controller updates (20 fresh Deployments) | Safe to retry, never ambiguous |
 | `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; Release CRD name and immutability rules enforced by the API server; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster | The simulated environment |
 | `tests/e2e/test_deploy.py` | First deployment; upgrade; promotion dev → staging → prod; `slow-start` succeeds after waiting; Release, state and audit are correct | Successful deployment |
 | `tests/e2e/test_rejections.py` | Invalid bundle is rejected with zero objects created; promotion gate; version re-used with a different image (rejected by the API server's CEL rule); degraded gate | Invalid input |
@@ -493,8 +512,10 @@ deploysim/
   paths.py         project root and the tool, schema and state paths under it
   bundle.py        loading release bundles, structure checks, bundle policy, bundle digest
   validate.py      pass 1: kubectl-validate offline, then bundle policy
-  kube.py          kubectl wrapper and safety guard
-  lease.py         Lease acquire, renew, takeover, release
+  errors.py        problems that mean exit code 5: missing tools, unsafe targets
+  clock.py         UTC clock and timestamp formats
+  kube.py          the only kubectl caller: safety guard, error classification, apply, drift
+  lease.py         Lease acquire, renew, takeover, release; all compare-and-swap
   state.py         state ConfigMap with compare-and-swap
   health.py        rollout verification
   controller.py    the stage machine
