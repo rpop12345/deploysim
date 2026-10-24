@@ -8,9 +8,11 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
+
+from deploysim.clock import iso_millis, utcnow
 
 GENESIS_HASH = "0" * 64
 _TAIL_BLOCK = 4096
@@ -72,15 +74,6 @@ def chain_hash(prev_hash: str, fields: dict[str, Any]) -> str:
     return hashlib.sha256((prev_hash + canonical).encode()).hexdigest()
 
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
-
-
-def _timestamp(moment: datetime) -> str:
-    utc = moment.astimezone(UTC)
-    return f"{utc:%Y-%m-%dT%H:%M:%S}.{utc.microsecond // 1000:03d}Z"
-
-
 def _parse(line: bytes) -> AuditRecord:
     try:
         return AuditRecord(**json.loads(line))
@@ -95,7 +88,7 @@ def _fields(record: AuditRecord) -> dict[str, Any]:
 
 
 class AuditLog:
-    def __init__(self, path: Path, clock: Callable[[], datetime] = _utcnow) -> None:
+    def __init__(self, path: Path, clock: Callable[[], datetime] = utcnow) -> None:
         self.path = path
         self._clock = clock
 
@@ -108,7 +101,7 @@ class AuditLog:
                 last = self._last_record(f)
                 draft = AuditRecord(
                     seq=last.seq + 1 if last else 1,
-                    ts=_timestamp(self._clock()),
+                    ts=iso_millis(self._clock()),
                     deployment_id=entry.deployment_id,
                     attempt=entry.attempt,
                     app=entry.app,

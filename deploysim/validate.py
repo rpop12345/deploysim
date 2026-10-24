@@ -20,13 +20,10 @@ from deploysim.bundle import (
     structure_violations,
     type_of,
 )
+from deploysim.errors import ToolError
 from deploysim.paths import Paths
 
 _SKIPPED_RULES_NOTICE = "some validation rules were not checked"
-
-
-class ToolError(Exception):
-    """A required tool or file is missing or misbehaved; nothing was validated."""
 
 
 @dataclass(frozen=True)

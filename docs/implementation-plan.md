@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P3.
+These are checked again at the end of each phase. They have been met for P0 to P4.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -29,8 +29,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P0 Scaffold and tooling | ✅ Done | `975ca45` |
 | P1 Simulated environment | ✅ Done | `d010efa` (PR #1, merged as `4e81ac6`) |
 | P2 Audit log | ✅ Done | `a01f40f` (PR #2, merged as `712c753`) |
-| P3 Bundle loading and offline validation | ✅ Done | not yet committed |
-| P4 Kubernetes access layer | ⬜ Not started | |
+| P3 Bundle loading and offline validation | ✅ Done | `829f0d2` (PR #3, merged as `6b23ac2`) |
+| P4 Kubernetes access layer | ✅ Done | not yet committed |
 | P5 Deploy, happy path | ⬜ Not started | |
 | P6 Rollback and degraded environments | ⬜ Not started | |
 | P7 Idempotency, drift and retries | ⬜ Not started | |
@@ -270,45 +270,78 @@ access.
 
 ## P4: Kubernetes access layer
 
+**Status:** ✅ Done
+
 **Goal:** typed, audited access to the cluster, with the safety guard, Lease locking and
 compare-and-swap state.
 
 **Deliverables**
-- `deploysim/kube.py`:
-  - `Kubectl(kubeconfig)` wrapping `bin/kubectl`, with the methods `get_json`, `apply`
-    (server-side, `--field-manager=deploysim`), `apply_dry_run`, `diff` (exit code to bool),
-    `create`, `replace` (carries `resourceVersion`), `delete`, `patch_status`;
-  - every call returns its exact argv for the audit log;
-  - stderr is classified into `NotFound`, `AlreadyExists`, `Conflict`, `Invalid`, `Unreachable`
-    and `Forbidden`.
+- `deploysim/errors.py`: `EnvironmentProblem` (exit 5) with `ToolError` and `UnsafeTarget`.
+- `deploysim/clock.py`: UTC clock; millisecond timestamps for audit and state; MicroTime for Leases.
+- `deploysim/kube.py`, the only module that runs kubectl:
+  - `Kubectl(binary, kubeconfig)` wraps `bin/kubectl`. Every call passes `--kubeconfig` and sets
+    `$KUBECONFIG` to the same file;
+  - `Kubectl.environment(name)` returns a namespace-bound `Environment` with `get`, `get_labelled`,
+    `create`, `replace` (compare-and-swap via `resourceVersion`), `apply` (server-side,
+    `--field-manager=deploysim`, `--force-conflicts`, optional `--dry-run=server`), `drift`,
+    `delete` and `patch_status`;
+  - every call returns its exact argv (`Result.cmd`) for the audit log;
+  - stderr is classified into `NotFound`, `AlreadyExists`, `Conflict`, `Invalid`, `Forbidden` and
+    `Unreachable` (exit 5). `Invalid` is checked before `Forbidden`, because immutable-field errors
+    contain both words;
+  - `drift(manifests)` compares each live object with a server-side dry-run apply made from the
+    same `resourceVersion`, ignoring `.status` and `managedFields`. It retries objects a controller
+    updated in between (up to 5 times). This replaced `kubectl diff`, which reported false changes
+    in 2 of 15 runs.
 - The safety guard, applied before any call:
-  - the current-context server host must be `127.0.0.1`, `::1` or `localhost`;
-  - the target namespace must be labelled `deploysim.io/simulator=true`;
+  - the current-context server host must be `127.0.0.1`, `::1` or `localhost`, checked when
+    `Kubectl` is constructed, before any process runs;
+  - the target namespace must exist and be labelled `deploysim.io/simulator=true`, checked by
+    `Kubectl.environment`;
   - a failure raises `UnsafeTarget`, which becomes exit code 5.
 - `deploysim/lease.py` (all writes are compare-and-swap):
-  - `acquire(holder, seconds)` creates the Lease, takes over an expired one, or raises `Locked`;
-  - `renew()`;
-  - `release()` clears the holder.
-- `deploysim/state.py`: a `State` dataclass matching the README, with `load()` (empty state when the
-  ConfigMap is missing) and `save()` carrying `resourceVersion`, which raises `Conflict` when stale.
+  - `acquire(env, app, holder, seconds, now)` creates `Lease deploysim-<app>`, takes over a
+    released or expired one (`took_over_from`, `leaseTransitions` + 1), or raises `Locked`;
+  - `renew(lease, now)`, which raises `Conflict` once another run has taken over (fencing);
+  - `release(lease, now)` clears the holder, so the next run acquires immediately.
+- `deploysim/state.py`: `State`, with fields in README order, plus `ReleaseRef`, `InFlight`,
+  `Outcome` and `Status`. `StateStore.load()` returns an empty state when ConfigMap
+  `deploysim-<app>` is missing. `StateStore.save()` creates it, or replaces it with the
+  `resourceVersion` it read, and raises `Conflict` when stale, including a lost create race.
 
 **Definition of done**
-- [ ] No module other than `kube.py` invokes `kubectl`.
-- [ ] All P4 tests pass.
+- [x] No module other than `kube.py` invokes `kubectl`. Only `kube.py` and `validate.py`
+      (kubectl-validate) import `subprocess`, and a unit test enforces this.
+- [x] All P4 tests pass (72 unit, 23 e2e; three consecutive green `make test` runs).
+- [x] Drift checking never reports a change straight after an apply: 0 of 50 in a stress run
+      (`kubectl diff`: 2 of 15), and 0 of 50 real changes missed.
 
 **Tests that must pass**
 
-| Test | Asserts |
-|---|---|
-| `tests/unit/test_kube.py::test_guard_refuses_remote` | A kubeconfig pointing at `https://example.com` raises `UnsafeTarget` before any subprocess runs |
-| `tests/unit/test_kube.py::test_error_classification[*]` | Recorded kubectl stderr samples map to the right error type |
-| `tests/e2e/test_kube.py::test_guard_refuses_unlabelled_namespace` | Namespace without the label leads to `UnsafeTarget` |
-| `tests/e2e/test_kube.py::test_lease_exclusive` | A second `acquire` raises `Locked` |
-| `tests/e2e/test_kube.py::test_lease_takeover_after_expiry` | After `seconds` elapse, a new holder acquires the Lease |
-| `tests/e2e/test_kube.py::test_lease_fencing` | The old holder's `renew()` after a takeover raises `Conflict` |
-| `tests/e2e/test_kube.py::test_lease_release` | After `release()`, another holder acquires immediately |
-| `tests/e2e/test_kube.py::test_state_roundtrip` | Save then load gives an identical `State` |
-| `tests/e2e/test_kube.py::test_state_cas` | Saving with a stale `resourceVersion` raises `Conflict`; the stored state is unchanged |
+| Test | Asserts | Status |
+|---|---|---|
+| `tests/unit/test_kube.py::test_guard_refuses_remote` | A kubeconfig pointing at `https://example.com:6443` raises `UnsafeTarget`; `subprocess.run` is never called | ✅ |
+| `tests/unit/test_kube.py::test_guard_accepts_loopback[*]` | `127.0.0.1`, `localhost` and `[::1]` are accepted | ✅ |
+| `tests/unit/test_kube.py::test_guard_missing_kubeconfig` | "run make cluster-up" | ✅ |
+| `tests/unit/test_kube.py::test_guard_unknown_current_context` | A current context with no matching entry is refused | ✅ |
+| `tests/unit/test_kube.py::test_missing_kubectl` | `ToolError` "run make tools" | ✅ |
+| `tests/unit/test_kube.py::test_run_pins_kubeconfig` | argv has `--kubeconfig <file>`; `$KUBECONFIG` is overridden to the same file | ✅ |
+| `tests/unit/test_kube.py::test_error_classification[*]` | 8 recorded kubectl stderr samples map to the right error type and message | ✅ |
+| `tests/unit/test_kube.py::test_only_kube_and_validate_spawn_processes` | Only `kube.py` and `validate.py` import `subprocess` | ✅ |
+| `tests/e2e/test_kube.py::test_guard_refuses_unlabelled_namespace` | A namespace without the label leads to `UnsafeTarget` | ✅ |
+| `tests/e2e/test_kube.py::test_guard_refuses_missing_namespace` | A missing namespace leads to `UnsafeTarget` | ✅ |
+| `tests/e2e/test_kube.py::test_lease_exclusive` | A second `acquire` raises `Locked` naming the holder | ✅ |
+| `tests/e2e/test_kube.py::test_lease_takeover_after_expiry` | After `seconds`, a new holder acquires; `took_over_from` and `leaseTransitions` are set | ✅ |
+| `tests/e2e/test_kube.py::test_lease_renew_extends` | A renewed Lease is still held past its original expiry | ✅ |
+| `tests/e2e/test_kube.py::test_lease_fencing` | The old holder's `renew()` and `release()` after a takeover raise `Conflict`; the new holder keeps it | ✅ |
+| `tests/e2e/test_kube.py::test_lease_release` | After `release()`, another holder acquires immediately | ✅ |
+| `tests/e2e/test_kube.py::test_state_roundtrip` | A full state, including `in_flight`, survives save and load | ✅ |
+| `tests/e2e/test_kube.py::test_state_cas` | Saving with a stale `resourceVersion` raises `Conflict`; the stored state is unchanged | ✅ |
+| `tests/e2e/test_kube.py::test_state_create_race` | Two first saves: the second raises `Conflict` | ✅ |
+| `tests/e2e/test_kube.py::test_apply_and_drift` | Applied unchanged: no drift; replicas changed: the Deployment drifts; new Service: listed | ✅ |
+| `tests/e2e/test_kube.py::test_drift_ignores_controller_updates` | 20 fresh Deployments: never drift straight after apply | ✅ |
+| `tests/e2e/test_kube.py::test_dry_run_rejects_invalid` | Server dry run raises `Invalid` with the CEL message | ✅ |
+| `tests/e2e/test_kube.py::test_patch_status` | Release status is written through the status subresource | ✅ |
 
 ---
 

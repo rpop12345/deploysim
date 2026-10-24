@@ -12,8 +12,9 @@ from typing import Any
 
 from deploysim import __version__
 from deploysim.audit import AuditError, AuditLog, Entry
+from deploysim.errors import EnvironmentProblem
 from deploysim.paths import Paths
-from deploysim.validate import ToolError, ValidationResult, validate_file
+from deploysim.validate import ValidationResult, validate_file
 
 
 class ExitCode(IntEnum):
@@ -65,7 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def validate_command(file: Path, paths: Paths, audit: AuditLog) -> int:
     try:
         result = validate_file(file, paths)
-    except ToolError as exc:
+    except EnvironmentProblem as exc:
         audit.append(
             Entry(
                 stage="VALIDATE",
