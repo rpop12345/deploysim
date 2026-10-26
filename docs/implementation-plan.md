@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P8.
+These are checked again at the end of each phase. They have been met for P0 to P9.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -34,8 +34,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P5 Deploy, happy path | ✅ Done | `8bcc598` (PR #5, merged as `7ee0de2`) |
 | P6 Rollback and degraded environments | ✅ Done | `e4a0f66` (PR #6, merged as `bad0cf1`) |
 | P7 Idempotency, drift and retries | ✅ Done | `206bdf6` (PR #7, merged as `1661258`) |
-| P8 Crash recovery | ✅ Done | not yet committed |
-| P9 CLI completeness and demo | ⬜ Not started | |
+| P8 Crash recovery | ✅ Done | `fb15d64` (PR #8, merged as `296a390`) |
+| P9 CLI completeness and demo | ✅ Done | not yet committed |
 | P10 CI complete | ⬜ Not started | |
 | P11 Documentation pass | ⬜ Not started | |
 
@@ -574,32 +574,49 @@ true after P6: exit 2, a `FAIL` VERIFY record, and `current` unchanged.
 
 ## P9: CLI completeness and demo
 
+**Status:** ✅ Done
+
 **Goal:** every command and exit code in the README behaves as documented, and the demo exercises
 them all.
 
 **Deliverables**
-- `deploysim history`, with `--app`, `--env`, `--deployment-id` filters and `--verify`.
-- Usage errors exit 64 (an `argparse` override).
-- `scripts/demo.sh`: runs the README walkthrough plus each failure scenario and asserts every exit
-  code. Exposed as `make demo`.
-- A coverage gate of 85% in `make test`.
+- `deploysim history`: JSON lines filtered by `--app`, `--env` and `--deployment-id`. `--verify`
+  checks the whole log and prints `{audit_log, records, verified, problems}`; it exits 1 if the
+  log was altered, with `ALTERED line N` on stderr.
+- `cli.Parser` overrides `ArgumentParser.error` so usage errors exit 64, including no command at
+  all.
+- `scripts/demo.sh`, run by `make demo`: 23 scenarios on copies of the examples under
+  `demo-<timestamp>`, with deadlines cut to 10 s and 20 s. Each asserts its exit code, covering
+  0, 1, 2, 3, 4, 5, 64 and 70 and every outcome. It deletes its app afterwards, unless `KEEP=1`,
+  and runs another CLI if `DEPLOYSIM` is set (for P10's wheel install). It needs `jq`.
+- `make test`: one pytest run over `tests/unit` and `tests/e2e` with `--cov-fail-under=85`.
+  Coverage measures the CLI subprocesses (`[tool.coverage.run] patch = ["subprocess"]`).
+- `tests/e2e/test_deploy.py::test_status` covers `status`'s success path.
 
 **Definition of done**
-- [ ] `make cluster-down cluster-up demo` passes from scratch.
-- [ ] Every command in the README runs verbatim.
-- [ ] All P9 tests pass.
+- [x] `make cluster-down cluster-up demo` passes from scratch: all 23 scenarios, in about 85 s.
+      This ran on a separate throwaway cluster (`CLUSTER_NAME=deploysim-scratch`, in its own
+      directory with its own `.deploysim/`), so the working cluster and its deployments were
+      untouched. The throwaway cluster was deleted afterwards.
+- [x] Every command in the README walkthrough runs verbatim on that fresh cluster, with the
+      documented exit codes (0, 0, 0, 0, 2, 2, 0, 0, 0) and end states (staging `HEALTHY` on
+      1.0.0, dev `HEALTHY` on 1.1.0).
+- [x] All P9 tests pass: 165 tests; coverage 96.1% against the 85% gate.
 
 **Tests that must pass**
 
-| Test | Asserts |
-|---|---|
-| `tests/unit/test_cli.py::test_usage_error_64` | An unknown flag or missing argument exits 64 |
-| `tests/unit/test_cli.py::test_summary_schema` | The deploy summary has exactly the README's keys and types |
-| `tests/unit/test_cli.py::test_history_verify_exit` | A tampered log makes `history --verify` exit non-zero |
-| `tests/unit/test_cli.py::test_unsafe_target_exit_5` | A non-loopback kubeconfig exits 5 |
-| `tests/unit/test_readme.py::test_exit_codes_match` | The README exit-code table equals the `ExitCode` enum |
-| `make demo` | Exit 0 |
-| `make test` | Coverage ≥ 85% |
+| Test | Asserts | Status |
+|---|---|---|
+| `tests/unit/test_cli.py::test_usage_error_64[*]` | No command, missing file, missing `--env`, invalid `--env`, unknown flag, invalid `history --env`, `recover` without `--env`: exit 64, `usage:` on stderr | ✅ |
+| `tests/unit/test_cli.py::test_summary_schema` | The deploy summary's keys equal the README example's keys, in order; values match the documented types; `rollback`, `recovery` and step shapes too | ✅ |
+| `tests/unit/test_cli.py::test_history_verify_exit` | Intact log: exit 0, `verified: true`, 3 records. Tampered line 2: exit 1, `ALTERED line 2` | ✅ |
+| `tests/unit/test_cli.py::test_history_filters` | `--app`, and `--app` with `--env`, select the right `seq`s | ✅ |
+| `tests/unit/test_cli.py::test_unsafe_target_exit_5` | `deploy` and `status` with a `prod.example.com` kubeconfig: exit 5, "refusing" | ✅ |
+| `tests/unit/test_readme.py::test_exit_codes_match` | The README exit-code table equals `ExitCode`; deleting the 70 row makes it fail | ✅ |
+| `tests/unit/test_readme.py::test_outcomes_documented` / `test_commands_documented` / `test_faults_documented` | Every `Outcome`, subcommand and `--inject-fault` value appears in the README | ✅ |
+| `tests/e2e/test_deploy.py::test_status` | `status` JSON: state `HEALTHY`, Release `Succeeded` with attempts 1, rollout `2/2 available` | ✅ |
+| `make demo` | Exit 0; all 23 scenarios as expected | ✅ |
+| `make test` | 165 passed; coverage ≥ 85% (96.1%) | ✅ |
 
 ---
 

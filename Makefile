@@ -41,7 +41,7 @@ KWOK_URL := https://github.com/kubernetes-sigs/kwok/releases/download/$(KWOK_VER
 KUBECTL_URL := https://dl.k8s.io/release/$(KUBE_VERSION)/bin/$(OS)/$(ARCH)/kubectl
 KUBECTL_VALIDATE_URL := https://github.com/kubernetes-sigs/kubectl-validate/releases/download/$(KUBECTL_VALIDATE_VERSION)/kubectl-validate_$(OS)_$(ARCH).tar.gz
 
-.PHONY: help tools cluster-up cluster-down schemas install-dev lint fmt test-unit test-e2e test package clean
+.PHONY: help tools cluster-up cluster-down schemas demo install-dev lint fmt test-unit test-e2e test package clean
 
 help: ## List targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "%-12s %s\n", $$1, $$2}'
@@ -60,6 +60,9 @@ cluster-down: ## Delete the KWOK cluster
 
 schemas: ## Export OpenAPI schemas from the running cluster into schemas/
 	@scripts/export-schemas.sh schemas
+
+demo: ## Run every scenario against the cluster, checking exit codes
+	@scripts/demo.sh
 
 install-dev: ## Create .venv with deploysim and dev tools
 	$(PYTHON) -m venv $(VENV)
@@ -82,7 +85,8 @@ test-unit: ## Unit tests; no cluster needed
 test-e2e: ## End-to-end tests; needs make cluster-up
 	$(VBIN)/pytest -m e2e tests/e2e
 
-test: test-unit test-e2e ## All tests
+test: ## All tests, with an 85% coverage gate; needs make cluster-up
+	$(VBIN)/pytest tests/unit tests/e2e --cov --cov-fail-under=85
 
 package: ## Build wheel and sdist into dist/
 	$(VBIN)/python -m build

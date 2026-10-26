@@ -28,16 +28,32 @@ before anything touches the cluster.
 
 ## Quick start
 
-Requires Python 3.11+ on macOS or Linux. Docker is not needed: KWOK's binary runtime runs the control
-plane as local processes.
+Requires Python 3.11+ on macOS or Linux, and `jq` for the demo. Docker is not needed: KWOK's binary
+runtime runs the control plane as local processes.
 
 ```sh
 make tools          # pinned kwokctl, kwok, kubectl, kubectl-validate into ./bin, checksums verified
 make cluster-up     # KWOK cluster: fake nodes, dev/staging/prod namespaces, Release CRD, fault stages
 make install-dev    # venv with deploysim, pytest, ruff, mypy
-make test           # unit tests, then end-to-end tests against the cluster
-make demo           # every scenario end to end, asserting exit codes
+make test           # unit and end-to-end tests against the cluster, 85% coverage gate (about 3 min)
+make demo           # 23 scenarios end to end, asserting every exit code (about 80 s)
 make cluster-down
+```
+
+`make demo` runs on copies of the example bundles under a fresh app name (`demo-<timestamp>`), with
+shorter deadlines so failures take seconds. It deletes that app afterwards, unless `KEEP=1`, and
+never touches your own deployments. Its output shows each scenario's exit code and outcome:
+
+```
+Automatic rollback
+  ok    exit 2   ROLLED_BACK          1.1.0 to staging, unhealthy: back to 1.0.0
+  ok    exit 2   ROLLED_BACK          1.2.0 (broken build) to dev: back to 1.1.0
+Crash recovery
+  ok    exit 70                       1.1.0 to staging crashes after DEPLOY
+  ok    exit 4   LOCKED               deploy while the dead run's lease is live
+  ok    exit 0   SUCCEEDED            deploy after expiry: recovers, then succeeds
+...
+all 23 scenarios exited as expected
 ```
 
 `make cluster-up` writes its kubeconfig to `.deploysim/kubeconfig`. It never reads or modifies
@@ -374,7 +390,13 @@ What each command does:
   when the restored release is unhealthy. A live Lease gives `LOCKED` (exit 4).
 - `status` prints, as JSON, the state ConfigMap, every Release of the app in that environment with
   its phase, and the live rollout status of its Deployments.
-- `history` prints audit records. `--verify` checks the hash chain and sequence numbers.
+- `history` prints the matching audit records as JSON lines, filtered by `--app`, `--env` and
+  `--deployment-id`. `--verify` checks the whole log's hash chain and sequence numbers. It prints
+  `{"records", "verified", "problems"}` and exits 1 if the log was altered, naming each altered
+  line on stderr.
+
+A usage error (a missing or unknown argument, an `--env` outside `dev`, `staging` and `prod`, or no
+command at all) exits 64.
 
 ## Outputs
 
@@ -508,8 +530,11 @@ controller adds a moment after creation.
 ```sh
 make test-unit   # no cluster needed
 make test-e2e    # needs `make cluster-up`
-make test        # both, coverage gate 85%
+make test        # both in one run, failing under 85% coverage of deploysim/
 ```
+
+Coverage includes the `deploysim` CLI processes that the end-to-end tests start (coverage's
+`patch = ["subprocess"]`), so it measures the controller as it actually runs.
 
 Unit tests run in about 5 seconds, most of it kubectl-validate. End-to-end tests each use a unique app name, so they share one
 cluster without interfering, and a short `progressDeadlineSeconds` so the failure cases take seconds.
@@ -518,13 +543,14 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 |---|---|---|
 | `tests/unit/test_validate.py` | Every example passes; each of the 23 fixtures in `tests/fixtures/invalid/` produces exactly the violations its header names; kubectl-validate never runs a hostile kubeconfig's credential plugin (with a control showing it would, unisolated); the bundle digest ignores order and formatting; `validate` exit codes, JSON and audit record | Invalid input |
 | `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted, reordered and truncated lines are detected; 8 concurrent writers produce one valid chain; every append is fsynced; record fields match this README | Audit-friendly result |
-| `tests/unit/test_cli.py` | Exit codes, summary JSON shape, usage error 64, safety guard refuses a non-loopback server | — |
+| `tests/unit/test_cli.py` | Usage errors exit 64; the deploy summary has exactly this README's keys, in order and with matching types; `history` filters and `history --verify` (exit 1 on a tampered log); `deploy` and `status` refuse a non-loopback kubeconfig with exit 5 | Audit-friendly result, never touch a real environment |
+| `tests/unit/test_readme.py` | This README's exit-code table equals `ExitCode`; every outcome, command and `--inject-fault` value is documented | — |
 | `tests/unit/test_kube.py` | The safety guard refuses a remote server, a missing kubeconfig, or an unknown context, before any process runs; every call pins `--kubeconfig` and `$KUBECONFIG`; recorded kubectl errors are classified correctly; only `kube.py` and `validate.py` start processes | Never touch a real environment |
 | `tests/e2e/test_kube.py` | An unlabelled or missing namespace is refused; a Lease is exclusive, renewable, released and taken over after expiry; a stale holder's renew and release fail with `Conflict`; state round-trips and a stale save fails with `Conflict`; drift sees real changes and never controller updates (20 fresh Deployments) | Safe to retry, never ambiguous |
 | `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; Release CRD name and immutability rules enforced by the API server; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster | The simulated environment |
 | `tests/unit/test_controller.py` | Deployment ID is stable, ignores defaulted fields, and changes with environment or bundle; in-cluster manifests carry labels and the bundle digest; outcome-to-exit-code mapping | Audit-friendly result |
 | `tests/unit/test_health.py` | Rollout decision for every state (unobserved, updating, terminating, unavailable, complete, deadline exceeded); the VERIFY loop waits, fails fast on the deadline, and times out | Simulated health check |
-| `tests/e2e/test_deploy.py` | First deployment (Release, state, bundle ConfigMap, Lease released, labels); upgrade replaces every pod; promotion dev → staging → prod; `slow-start` succeeds after waiting; audit trail in stage order with commands; a failed health check exits 2 and leaves `current` untouched | Successful deployment, failed health check |
+| `tests/e2e/test_deploy.py` | First deployment (Release, state, bundle ConfigMap, Lease released, labels); upgrade replaces every pod; promotion dev → staging → prod; `slow-start` succeeds after waiting; audit trail in stage order with commands; a failed health check exits 2 and leaves `current` untouched; `status` reports state, Releases and rollout | Successful deployment, failed health check |
 | `tests/e2e/test_rejections.py` | An invalid bundle creates nothing; the promotion gate rejects a release new to staging and a changed bundle; reusing a version with a different image or manifests is rejected; a held Lease gives exit 4 and changes nothing; a `DEGRADED` environment needs `--allow-degraded` | Invalid input, repeated execution |
 | `tests/e2e/test_rollback.py` | `--inject-fault unhealthy` upgrade rolls back to the previous release, and its pods keep serving: ready old pods never drop below `replicas - maxUnavailable`, sampled throughout; the stored bundle stays unannotated; a broken build (fault in the bundle) rolls back; an unhealthy first deployment removes its objects and returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3; a `DEGRADED` environment needs `--allow-degraded`. After every scenario there is no `in_flight` record. | Failed health check, rollback |
 | `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`, with no write step and the state, Release, Deployment generation and ReplicaSets unchanged; a manual `kubectl scale` is detected and corrected; retry after rollback is attempt 2 with the same deployment ID; two concurrent deploys give exactly one exit 0 and one exit 4, with consistent state; a downgrade is flagged | Repeated execution |

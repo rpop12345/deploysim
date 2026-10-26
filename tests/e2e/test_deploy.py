@@ -12,6 +12,7 @@ from tests.e2e.support import (
     CliRun,
     Kubectl,
     Manifest,
+    deploysim,
     image,
     state_of,
     wait_for,
@@ -138,3 +139,21 @@ def test_verify_failure_stops(kubectl: Kubectl, app: str, tmp_path: Path, deploy
     assert verify["detail"]["reason"] == "ProgressDeadlineExceeded"
     assert state_of(kubectl, app, "dev")["current"]["release"] == f"{app}-1.0.0"
     assert release_status(kubectl, app, "1.1.0")["phase"] != "Succeeded"
+
+
+def test_status(app: str, tmp_path: Path, deploy: Deploy, audit_log: Path) -> None:
+    deploy(write_bundle(tmp_path, app, "1.0.0", replicas=2), "dev")
+
+    result = deploysim("status", "--app", app, "--env", "dev", audit_log=audit_log)
+
+    assert result.code == 0, result.stderr
+    status = result.summary
+    assert (status["app"], status["environment"]) == (app, "dev")
+    assert status["state"]["status"] == "HEALTHY"
+    assert status["state"]["current"]["release"] == f"{app}-1.0.0"
+    assert status["releases"] == [
+        {"name": f"{app}-1.0.0", "version": "1.0.0", "phase": "Succeeded", "attempts": 1}
+    ]
+    assert status["rollout"] == [
+        {"name": app, "complete": True, "failed": False, "message": "2/2 available"}
+    ]
