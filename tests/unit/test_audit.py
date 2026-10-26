@@ -218,3 +218,16 @@ def test_unreadable_line_raises_on_records(log: AuditLog) -> None:
 
     with pytest.raises(AuditError, match=r"audit.jsonl:2: unreadable record"):
         log.records()
+
+
+def test_unwritable_log_raises_audit_error(tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    log = AuditLog(locked / "audit.jsonl")
+
+    try:
+        with pytest.raises(AuditError, match="cannot write"):
+            log.append(entry())
+    finally:
+        locked.chmod(0o700)

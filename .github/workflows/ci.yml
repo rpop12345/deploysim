@@ -73,7 +73,8 @@ jobs:
         run: |
           failed=0
           for bundle in examples/*.yaml; do
-            .venv/bin/deploysim validate "$bundle" --audit-log /dev/null >/dev/null || failed=1
+            .venv/bin/deploysim validate "$bundle" --audit-log "$RUNNER_TEMP/audit.jsonl" \
+              >/dev/null || failed=1
           done
           exit "$failed"
 

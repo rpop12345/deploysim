@@ -137,3 +137,19 @@ def test_unsafe_target_exit_5(tmp_path: Path) -> None:
     assert "refusing https://prod.example.com:6443" in summary["error"]
     assert status.returncode == 5
     assert "refusing https://prod.example.com:6443" in status.stderr
+
+
+def test_unwritable_audit_log_exit_5(tmp_path: Path) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+
+    try:
+        result = cli("validate", str(EXAMPLE), "--audit-log", str(locked / "audit.jsonl"))
+    finally:
+        locked.chmod(0o700)
+
+    assert result.returncode == 5
+    assert "audit log" in result.stderr
+    assert "cannot write" in result.stderr
+    assert "Traceback" not in result.stderr
