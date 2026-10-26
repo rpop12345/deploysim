@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+import secrets
 import subprocess
 import time
 from pathlib import Path
@@ -141,3 +145,89 @@ def test_schemas_current(kubectl: Kubectl, tmp_path: Path) -> None:
 
     for path in ("api/v1.json", "apis/apps/v1.json"):
         assert (tmp_path / path).read_bytes() == (REPO / "schemas" / path).read_bytes(), path
+
+
+def test_bundle_configmap_immutable_on_server(kubectl: Kubectl, app: str) -> None:
+    def configmap(value: str) -> Manifest:
+        return {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": f"deploysim-{app}-1.0.0", "labels": {NAME_LABEL: app}},
+            "immutable": True,
+            "data": {"objects.json": value},
+        }
+
+    kubectl.apply(configmap("[]"), namespace="dev")
+
+    changed = kubectl.apply(configmap('[{"kind": "Deployment"}]'), namespace="dev", check=False)
+
+    assert changed.returncode != 0
+    assert "field is immutable" in changed.stderr
+
+
+def kube_config_digest() -> str | None:
+    path = Path.home() / ".kube" / "config"
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+
+def makefile_version(name: str) -> str:
+    match = re.search(rf"^{name}\s*:=\s*(\S+)$", (REPO / "Makefile").read_text(), re.MULTILINE)
+    assert match, name
+    return match.group(1)
+
+
+def test_cluster_lifecycle(tmp_path: Path) -> None:
+    """cluster-up on its own throwaway cluster: create, re-run, stopped, other fingerprint."""
+    root = tmp_path / "root"
+    root.mkdir()
+    for name in ("bin", "kwok", "crds", "scripts"):
+        (root / name).symlink_to(REPO / name)
+    env = {
+        **os.environ,
+        "CLUSTER_NAME": f"deploysim-t{secrets.token_hex(3)}",
+        "KWOK_VERSION": makefile_version("KWOK_VERSION"),
+        "KWOK_KUBE_VERSION": makefile_version("KUBE_VERSION"),
+    }
+    kubeconfig = root / ".deploysim" / "kubeconfig"
+    before = kube_config_digest()
+
+    def script(name: str) -> subprocess.CompletedProcess[str]:
+        command = [str(root / "scripts" / name)]
+        return subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
+
+    def versions() -> list[str]:
+        local = Kubectl(kubeconfig)
+        objects = local.get("namespaces", "-l", "deploysim.io/simulator=true")["items"]
+        objects.append(local.get("crd", "releases.deploysim.io"))
+        return [obj["metadata"]["resourceVersion"] for obj in objects]
+
+    try:
+        created = script("cluster-up.sh")
+        assert created.returncode == 0, created.stderr
+        assert "creating cluster" in created.stderr
+        first = versions()
+
+        rerun = script("cluster-up.sh")
+        assert rerun.returncode == 0, rerun.stderr
+        assert "creating cluster" not in rerun.stderr
+        assert versions() == first
+
+        subprocess.run(
+            [str(REPO / "bin" / "kwokctl"), "stop", "cluster", "--name", env["CLUSTER_NAME"]],
+            env=env,
+            capture_output=True,
+            check=True,
+        )
+        restarted = script("cluster-up.sh")
+        assert restarted.returncode == 0, restarted.stderr
+        assert "is stopped; recreating it empty" in restarted.stderr
+
+        (root / ".deploysim" / "cluster.fingerprint").write_text("stale\n")
+        refused = script("cluster-up.sh")
+        assert refused.returncode == 1
+        assert "created from other stages or versions" in refused.stderr
+    finally:
+        down = script("cluster-down.sh")
+    assert down.returncode == 0, down.stderr
+    assert not kubeconfig.exists()
+    assert kube_config_digest() == before

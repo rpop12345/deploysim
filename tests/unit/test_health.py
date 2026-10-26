@@ -49,7 +49,12 @@ def deployment(
         ({"updated": 1}, False, False, "1 of 3 replicas updated"),
         ({"total": 4}, False, False, "1 old replicas terminating"),
         ({"available": 2}, False, False, "2 of 3 replicas available"),
-        ({"available": 0, "deadline_exceeded": True}, False, True, "progress deadline exceeded"),
+        (
+            {"updated": 1, "available": 3, "deadline_exceeded": True},
+            False,
+            True,
+            "progress deadline exceeded: 1 of 3 replicas updated, 3 available",
+        ),
     ],
     ids=["complete", "unobserved", "updating", "terminating", "unavailable", "deadline"],
 )
