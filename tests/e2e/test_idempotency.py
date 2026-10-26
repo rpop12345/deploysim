@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -10,9 +11,11 @@ from tests.e2e.support import (
     CliRun,
     Kubectl,
     Manifest,
+    deploysim,
     finish,
     start_deploysim,
     state_of,
+    wait_for,
     write_bundle,
 )
 
@@ -131,3 +134,26 @@ def test_downgrade_flagged(app: str, tmp_path: Path, deploy: Deploy, audit_log: 
     assert step(result, "record_intent")["detail"]["downgrade"] is True
     intents = [r for r in AuditLog(audit_log).records() if r.action == "record_intent"]
     assert [r.detail["downgrade"] for r in intents] == [False, False, True]
+
+
+def test_lease_renewed_while_verifying(
+    kubectl: Kubectl, app: str, tmp_path: Path, audit_log: Path
+) -> None:
+    """A 2 s Lease outlives itself because VERIFY renews it on every poll."""
+    bundle = write_bundle(tmp_path, app, "1.0.0", fault="slow-start")
+    args = ["deploy", str(bundle), "--env", "dev"]
+    slow = start_deploysim(*args, "--lease-seconds", "2", audit_log=audit_log)
+
+    def verifying() -> bool:
+        name = f"releases.deploysim.io/{app}-1.0.0"
+        phase = kubectl.run("get", name, "-n", "dev", "-o", "jsonpath={.status.phase}", check=False)
+        return phase.stdout == "Verifying"
+
+    wait_for(verifying, timeout=10)
+    time.sleep(2.5)
+    competing = deploysim(*args, audit_log=audit_log)
+    finished = finish(slow)
+
+    assert competing.code == 4, competing.stderr
+    assert finished.code == 0, finished.stderr
+    assert finished.summary["outcome"] == "SUCCEEDED"

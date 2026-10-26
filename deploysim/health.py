@@ -39,7 +39,10 @@ def rollout_status(deployment: Manifest) -> RolloutStatus:
     for condition in status.get("conditions") or []:
         reason = condition.get("reason")
         if condition["type"] == "Progressing" and reason == "ProgressDeadlineExceeded":
-            message = f"progress deadline exceeded: {available}/{replicas} available"
+            message = (
+                f"progress deadline exceeded: {updated} of {replicas} replicas updated, "
+                f"{available} available"
+            )
             return RolloutStatus(name, False, True, message)
     if updated < replicas:
         return RolloutStatus(name, False, False, f"{updated} of {replicas} replicas updated")

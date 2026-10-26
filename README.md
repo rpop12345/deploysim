@@ -216,7 +216,7 @@ REJECTED Deployment/orders-api: kubectl-validate:spec.replica: Invalid value: va
 The JSON goes to stdout; the `REJECTED` lines go to stderr. Exit codes:
 - 0 for `VALID`;
 - 1 for `REJECTED`;
-- 5 when kubectl-validate, `schemas/` or `crds/` is missing.
+- 5 when kubectl-validate, `schemas/` or `crds/` is missing, or the audit log cannot be written.
 
 Every run appends one `VALIDATE` record to the audit log.
 
@@ -256,7 +256,7 @@ semantic-version precedence, so `1.0.0-rc.1` < `1.0.0` < `1.10.0`.
         │
       LOCK  (Lease) ──held by a live run─────────────────────────► LOCKED           exit 4
         │
-     RECOVER  only if a previous run died mid-deployment
+     RECOVER  only if a previous run died ──restore fails────────► ROLLBACK_FAILED  exit 3
         │
  VALIDATE (cluster) ──fail──────────────────────────────────────► REJECTED         exit 1
         │
@@ -275,9 +275,9 @@ semantic-version precedence, so `1.0.0-rc.1` < `1.0.0` < `1.10.0`.
 
 | Stage | What it does |
 |---|---|
-| `LOCK` | Creates the `Lease` `deploysim-<app>` in the environment namespace. A Lease held by a live run gives `LOCKED`. An expired Lease is taken over with a compare-and-swap write, and the takeover is audited. The Lease is renewed on every `VERIFY` poll. |
+| `LOCK` | Creates the `Lease` `deploysim-<app>` in the environment namespace. A Lease held by a live run gives `LOCKED`. An expired Lease is taken over with a compare-and-swap write, and the takeover is audited. The Lease is renewed on every rollout poll, in `VERIFY`, `ROLLBACK` and `RECOVER`. |
 | `RECOVER` | Runs when the state still has an `in_flight` record but no live run holds the Lease, which means the previous run died. It re-applies that record's `previous` release and verifies it. If there was no previous release, it deletes the target's stored objects and the environment becomes `EMPTY`. It then clears `in_flight`, records the attempt as `INTERRUPTED`, and sets the target Release's phase to `Interrupted`. If the restored release fails its check, the environment becomes `DEGRADED`, the outcome is `ROLLBACK_FAILED` (exit 3), and the requested deploy does not run. |
-| `PREPARE` | Writes `in_flight` (deployment ID, attempt, target, previous, stage) to the state ConfigMap. Stores the bundle in an immutable ConfigMap. Applies the `Release` and sets its phase to `Deploying`. All of this happens before the workload changes, so a crash at any later point is recoverable. |
+| `PREPARE` | Writes `in_flight` (deployment ID, attempt, target, `previous` = `last_known_good`, stage) to the state ConfigMap. Stores the bundle in an immutable ConfigMap. Applies the `Release` and sets its phase to `Deploying`. All of this happens before the workload changes, so a crash at any later point is recoverable. |
 | `DEPLOY` | `kubectl apply --server-side --field-manager=deploysim --force-conflicts` of the workload objects, each labelled `app.kubernetes.io/managed-by: deploysim`. |
 | `VERIFY` | Polls every Deployment in the bundle every 0.5 s and renews the Lease on each poll. It passes when the rollout is complete, by the same rule `kubectl rollout status` uses: `observedGeneration` is current, no old replicas remain, and the updated and available replica counts equal `replicas`. It fails as soon as the `Progressing` condition reports `ProgressDeadlineExceeded`, or when `healthCheck.timeoutSeconds` elapses. |
 | `COMPLETE` | Sets `current` and `last_known_good` to the target, clears `in_flight`, and sets the Release phase to `Succeeded`. |
@@ -330,34 +330,52 @@ All state lives in the cluster, in the environment's namespace, so any runner se
 | `ConfigMap` | `deploysim-<app>` | Controller state: `current`, `last_known_good`, `in_flight`, `attempts`, `status` |
 | `Lease` | `deploysim-<app>` | The lock: holder, duration, renew time |
 
+After the walkthrough above, on a fresh cluster:
+
 ```
-$ kubectl get releases -n staging
+$ bin/kubectl --kubeconfig .deploysim/kubeconfig get releases -n staging
 NAME               VERSION   PHASE        ATTEMPTS   AGE
-orders-api-1.0.0   1.0.0     Succeeded    1          6m
-orders-api-1.1.0   1.1.0     RolledBack   1          2m
+orders-api-1.0.0   1.0.0     Succeeded    1          51s
+orders-api-1.1.0   1.1.0     RolledBack   1          47s
 ```
 
-The state ConfigMap's `state.json`:
+The state ConfigMap's `state.json` at that point:
 
 ```json
 {
   "app": "orders-api",
   "environment": "staging",
   "status": "HEALTHY",
-  "current":         { "release": "orders-api-1.0.0", "version": "1.0.0", "image": "registry.example.com/orders-api@sha256:1e0b…" },
-  "last_known_good": { "release": "orders-api-1.0.0", "version": "1.0.0", "image": "registry.example.com/orders-api@sha256:1e0b…" },
+  "current": {
+    "release": "orders-api-1.0.0",
+    "version": "1.0.0",
+    "image": "registry.example.com/orders-api@sha256:60721df325892970d02392ff6de5b353f71146cd60b3707184b8d2ec58ba449b"
+  },
+  "last_known_good": {
+    "release": "orders-api-1.0.0",
+    "version": "1.0.0",
+    "image": "registry.example.com/orders-api@sha256:60721df325892970d02392ff6de5b353f71146cd60b3707184b8d2ec58ba449b"
+  },
   "in_flight": null,
-  "last_outcome": { "deployment_id": "dep-3f9a1c2b7e4d", "attempt": 1, "outcome": "ROLLED_BACK" },
-  "attempts": { "dep-a81f0c3d92b7": 1, "dep-3f9a1c2b7e4d": 1 },
-  "updated_at": "2026-10-22T14:03:13.204Z"
+  "last_outcome": {
+    "deployment_id": "dep-ccff7c080b29",
+    "attempt": 1,
+    "outcome": "ROLLED_BACK"
+  },
+  "attempts": {
+    "dep-9037d87078d5": 1,
+    "dep-ccff7c080b29": 1
+  },
+  "updated_at": "2026-10-26T12:13:19.843Z"
 }
 ```
 
 `status` is one of `EMPTY`, `HEALTHY`, `DEPLOYING` (an `in_flight` record exists), or `DEGRADED`
 (a rollback failed).
 
-Every state write is a `kubectl replace` that carries the `resourceVersion` it read. A concurrent
-writer gets `409 Conflict` instead of silently overwriting. This compare-and-swap is also the fencing
+Every state write is a `kubectl replace` that carries the `resourceVersion` it read; the very first
+is a `kubectl create`. A concurrent writer gets `409 Conflict`, or `AlreadyExists` on that first
+write, instead of silently overwriting. This compare-and-swap is also the fencing
 token: a run whose Lease expired and was taken over cannot clobber the new holder's state.
 
 Version immutability is enforced in two places by the API server, not just by deploysim. A CEL
@@ -402,9 +420,12 @@ command at all) exits 64.
 
 ### Deployment summary (stdout)
 
+The walkthrough's fifth command, which rolls 1.1.0 back in staging. This is real output; only
+the `detail` of steps other than `rollout_status` is left out here.
+
 ```json
 {
-  "deployment_id": "dep-3f9a1c2b7e4d",
+  "deployment_id": "dep-ccff7c080b29",
   "attempt": 1,
   "app": "orders-api",
   "environment": "staging",
@@ -416,37 +437,90 @@ command at all) exits 64.
   "drift_corrected": false,
   "final": "orders-api-1.0.0",
   "environment_status": "HEALTHY",
-  "started_at": "2026-10-22T14:02:21.981Z",
-  "finished_at": "2026-10-22T14:03:13.204Z",
+  "started_at": "2026-10-26T12:12:32.322Z",
+  "finished_at": "2026-10-26T12:13:20.009Z",
   "violations": [],
   "steps": [
-    { "seq": 41, "stage": "VALIDATE", "action": "kubectl_validate",  "result": "OK" },
-    { "seq": 42, "stage": "VALIDATE", "action": "bundle_policy",     "result": "OK" },
-    { "seq": 43, "stage": "LOCK",     "action": "acquire_lease",     "result": "OK" },
-    { "seq": 44, "stage": "VALIDATE", "action": "server_dry_run",    "result": "OK" },
-    { "seq": 45, "stage": "PREPARE",  "action": "record_intent",     "result": "OK" },
-    { "seq": 46, "stage": "DEPLOY",   "action": "apply",             "result": "OK" },
-    { "seq": 47, "stage": "VERIFY",   "action": "rollout_status",    "result": "FAIL",
-      "detail": { "reason": "ProgressDeadlineExceeded", "ready": "0/1 updated", "waited_s": 46 } },
-    { "seq": 48, "stage": "ROLLBACK", "action": "apply",             "result": "OK" },
-    { "seq": 49, "stage": "ROLLBACK", "action": "rollout_status",    "result": "OK" },
-    { "seq": 50, "stage": "LOCK",     "action": "release_lease",     "result": "OK" }
-  ]
+    { "seq": 54, "stage": "VALIDATE", "action": "validate_bundle", "result": "OK" },
+    { "seq": 55, "stage": "LOCK", "action": "acquire_lease", "result": "OK" },
+    { "seq": 56, "stage": "VALIDATE", "action": "load_state", "result": "OK" },
+    { "seq": 57, "stage": "VALIDATE", "action": "promotion_gate", "result": "OK" },
+    { "seq": 58, "stage": "VALIDATE", "action": "immutability", "result": "OK" },
+    { "seq": 59, "stage": "VALIDATE", "action": "server_dry_run", "result": "OK" },
+    { "seq": 60, "stage": "VALIDATE", "action": "desired_state", "result": "DEPLOY" },
+    { "seq": 61, "stage": "PREPARE", "action": "record_intent", "result": "OK" },
+    { "seq": 62, "stage": "PREPARE", "action": "store_bundle", "result": "OK" },
+    { "seq": 63, "stage": "PREPARE", "action": "record_release", "result": "OK" },
+    { "seq": 64, "stage": "PREPARE", "action": "release_phase", "result": "OK" },
+    { "seq": 65, "stage": "DEPLOY", "action": "apply", "result": "OK" },
+    { "seq": 66, "stage": "DEPLOY", "action": "record_stage", "result": "OK" },
+    { "seq": 67, "stage": "VERIFY", "action": "release_phase", "result": "OK" },
+    { "seq": 68, "stage": "VERIFY", "action": "rollout_status", "result": "FAIL",
+      "detail": {"reason": "ProgressDeadlineExceeded", "waited_s": 46.2, "polls": 75, "deployments": [{"name": "orders-api", "message": "progress deadline exceeded: 1 of 3 replicas updated, 3 available"}]} },
+    { "seq": 69, "stage": "ROLLBACK", "action": "record_stage", "result": "OK" },
+    { "seq": 70, "stage": "ROLLBACK", "action": "load_bundle", "result": "OK" },
+    { "seq": 71, "stage": "ROLLBACK", "action": "apply", "result": "OK" },
+    { "seq": 72, "stage": "ROLLBACK", "action": "rollout_status", "result": "OK",
+      "detail": {"reason": "Complete", "waited_s": 0.1, "polls": 1, "deployments": [{"name": "orders-api", "message": "3/3 available"}]} },
+    { "seq": 73, "stage": "ROLLBACK", "action": "record_outcome", "result": "OK" },
+    { "seq": 74, "stage": "ROLLBACK", "action": "release_phase", "result": "OK" },
+    { "seq": 75, "stage": "LOCK", "action": "release_lease", "result": "OK" }
+  ],
+  "error": "health check failed: ProgressDeadlineExceeded; rolled back to orders-api-1.0.0"
 }
 ```
 
 `deployment_id` is derived from `sha256(app | environment | release spec | bundle digest)`, so the
 same release to the same environment always gets the same ID, and its attempts can be counted.
 `attempt` is assigned at `PREPARE`. It is `null` when no deployment was attempted: `REJECTED`,
-`LOCKED` and `NO_OP`.
+`LOCKED` and `NO_OP`. `error` is present only when the run did not succeed; a `REJECTED` run
+lists its `violations` instead.
 
 ### Audit log
 
 `.deploysim/audit.jsonl` holds one record per action, for every invocation, including rejected ones.
 Each record is flushed and fsynced before the next action starts.
 
+The walkthrough's `DEPLOY apply` record for that run, formatted here (one line in the file;
+`cmd` holds absolute paths, shortened here):
+
 ```json
-{"seq":46,"ts":"2026-10-22T14:02:26.410Z","deployment_id":"dep-3f9a1c2b7e4d","attempt":1,"app":"orders-api","environment":"staging","stage":"DEPLOY","action":"apply","result":"OK","cmd":["kubectl","apply","--server-side","--field-manager=deploysim","-n","staging","-f","-"],"detail":{"objects":["Deployment/orders-api","Service/orders-api"]},"prev_hash":"9b1e…","hash":"c04a…"}
+{
+  "seq": 65,
+  "ts": "2026-10-26T12:12:33.192Z",
+  "deployment_id": "dep-ccff7c080b29",
+  "attempt": 1,
+  "app": "orders-api",
+  "environment": "staging",
+  "stage": "DEPLOY",
+  "action": "apply",
+  "result": "OK",
+  "cmd": [
+    "bin/kubectl",
+    "--kubeconfig",
+    ".deploysim/kubeconfig",
+    "apply",
+    "--server-side",
+    "--field-manager=deploysim",
+    "--force-conflicts",
+    "-n",
+    "staging",
+    "-f",
+    "-",
+    "-o",
+    "json"
+  ],
+  "detail": {
+    "objects": [
+      "ConfigMap/orders-api-config",
+      "Deployment/orders-api",
+      "Service/orders-api"
+    ],
+    "injected_fault": "unhealthy"
+  },
+  "prev_hash": "3323d79803ea6864028c00557c9d4b9e685cbc5c718d739115cdcafd6845a3e1",
+  "hash": "6a4e177f407b8619b82e5fa26c0e9ee2e0fded862f9dabfb83e25dd8c1f13475"
+}
 ```
 
 - `seq` is gap-free and is the ordering authority; `ts` is wall-clock UTC for humans.
@@ -465,7 +539,7 @@ Each record is flushed and fsynced before the next action starts.
 | 2 | `ROLLED_BACK`: health check failed, previous release restored and healthy |
 | 3 | `ROLLBACK_FAILED`: environment `DEGRADED`, operator action needed |
 | 4 | `LOCKED`: another live run holds the Lease |
-| 5 | `ENVIRONMENT_ERROR`: missing tool, unreachable cluster, or safety guard refused. If it happens mid-deployment, the next run recovers. |
+| 5 | `ENVIRONMENT_ERROR`: missing tool, unreachable cluster, unwritable audit log, safety guard refused, or the Lease was taken over. If it happens mid-deployment, the next run recovers. |
 | 64 | Usage error (`EX_USAGE`, so it never collides with 2) |
 | 70 | Simulated crash (`--inject-fault crash-*`). Nothing is cleaned up; the next run recovers. |
 
@@ -536,26 +610,33 @@ make test        # both in one run, failing under 85% coverage of deploysim/
 Coverage includes the `deploysim` CLI processes that the end-to-end tests start (coverage's
 `patch = ["subprocess"]`), so it measures the controller as it actually runs.
 
-Unit tests run in about 5 seconds, most of it kubectl-validate. End-to-end tests each use a unique app name, so they share one
-cluster without interfering, and a short `progressDeadlineSeconds` so the failure cases take seconds.
+Unit tests take about 6 seconds, most of it kubectl-validate. End-to-end tests each use a unique app
+name, so they share one cluster without interfering. They use a short `progressDeadlineSeconds`, so
+the failure cases take seconds.
 
 | File | Scenarios | Brief requirement |
 |---|---|---|
+| `tests/unit/test_smoke.py` | `deploysim --version` and `python -m deploysim --version` | — |
+| `tests/unit/test_install_tool.py` | A tool is installed and recorded; a second run downloads nothing; a wrong checksum leaves no binary; tar members are extracted; a platform with no pinned checksum fails | — |
 | `tests/unit/test_validate.py` | Every example passes; each of the 23 fixtures in `tests/fixtures/invalid/` produces exactly the violations its header names; kubectl-validate never runs a hostile kubeconfig's credential plugin (with a control showing it would, unisolated); the bundle digest ignores order and formatting; `validate` exit codes, JSON and audit record | Invalid input |
-| `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted, reordered and truncated lines are detected; 8 concurrent writers produce one valid chain; every append is fsynced; record fields match this README | Audit-friendly result |
-| `tests/unit/test_cli.py` | Usage errors exit 64; the deploy summary has exactly this README's keys, in order and with matching types; `history` filters and `history --verify` (exit 1 on a tampered log); `deploy` and `status` refuse a non-loopback kubeconfig with exit 5 | Audit-friendly result, never touch a real environment |
-| `tests/unit/test_readme.py` | This README's exit-code table equals `ExitCode`; every outcome, command and `--inject-fault` value is documented | — |
+| `tests/unit/test_bundle.py` | Semantic-version precedence, using the specification's own ordering example | Repeated execution |
+| `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted, reordered and truncated lines are detected; 8 concurrent writers produce one valid chain; every append is fsynced; an unwritable log raises `AuditError`; record fields match this README | Audit-friendly result |
 | `tests/unit/test_kube.py` | The safety guard refuses a remote server, a missing kubeconfig, or an unknown context, before any process runs; every call pins `--kubeconfig` and `$KUBECONFIG`; recorded kubectl errors are classified correctly; only `kube.py` and `validate.py` start processes | Never touch a real environment |
+| `tests/unit/test_health.py` | Rollout decision for every state (unobserved, updating, terminating, unavailable, complete, deadline exceeded); the VERIFY loop waits, renews on every poll, fails fast on the deadline, and times out | Simulated health check |
+| `tests/unit/test_controller.py` | Deployment ID is stable, ignores defaulted fields, and changes with environment or bundle; in-cluster manifests carry labels and the bundle digest; fault injection touches only pod templates; outcome-to-exit-code mapping | Audit-friendly result |
+| `tests/unit/test_cli.py` | Usage errors exit 64; the deploy summary has exactly this README's keys, in order and with matching types; `history` filters and `history --verify` (exit 1 on a tampered log); `deploy` and `status` refuse a non-loopback kubeconfig with exit 5; an unwritable audit log exits 5 without a traceback | Audit-friendly result, never touch a real environment |
+| `tests/unit/test_readme.py` | This README's exit-code table equals `ExitCode`; every outcome, command and `--inject-fault` value is documented | — |
+| `tests/unit/test_repo.py` | Every CI action is pinned to a commit SHA; PyYAML is the only runtime dependency; every tool has a pinned SHA-256 for all four platforms; no script reads `~/.kube` or calls kwokctl or kubectl without `--kubeconfig` | Never touch a real environment |
+| `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; the API server enforces the Release name rule, Release spec immutability and the immutable bundle ConfigMap; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster. `cluster-up` on its own throwaway cluster: creates, re-runs without changes, recreates a stopped cluster, refuses another fingerprint, and leaves `~/.kube/config` unchanged. | The simulated environment |
 | `tests/e2e/test_kube.py` | An unlabelled or missing namespace is refused; a Lease is exclusive, renewable, released and taken over after expiry; a stale holder's renew and release fail with `Conflict`; state round-trips and a stale save fails with `Conflict`; drift sees real changes and never controller updates (20 fresh Deployments) | Safe to retry, never ambiguous |
-| `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; Release CRD name and immutability rules enforced by the API server; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster | The simulated environment |
-| `tests/unit/test_controller.py` | Deployment ID is stable, ignores defaulted fields, and changes with environment or bundle; in-cluster manifests carry labels and the bundle digest; outcome-to-exit-code mapping | Audit-friendly result |
-| `tests/unit/test_health.py` | Rollout decision for every state (unobserved, updating, terminating, unavailable, complete, deadline exceeded); the VERIFY loop waits, fails fast on the deadline, and times out | Simulated health check |
 | `tests/e2e/test_deploy.py` | First deployment (Release, state, bundle ConfigMap, Lease released, labels); upgrade replaces every pod; promotion dev → staging → prod; `slow-start` succeeds after waiting; audit trail in stage order with commands; a failed health check exits 2 and leaves `current` untouched; `status` reports state, Releases and rollout | Successful deployment, failed health check |
 | `tests/e2e/test_rejections.py` | An invalid bundle creates nothing; the promotion gate rejects a release new to staging and a changed bundle; reusing a version with a different image or manifests is rejected; a held Lease gives exit 4 and changes nothing; a `DEGRADED` environment needs `--allow-degraded` | Invalid input, repeated execution |
 | `tests/e2e/test_rollback.py` | `--inject-fault unhealthy` upgrade rolls back to the previous release, and its pods keep serving: ready old pods never drop below `replicas - maxUnavailable`, sampled throughout; the stored bundle stays unannotated; a broken build (fault in the bundle) rolls back; an unhealthy first deployment removes its objects and returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3; a `DEGRADED` environment needs `--allow-degraded`. After every scenario there is no `in_flight` record. | Failed health check, rollback |
-| `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`, with no write step and the state, Release, Deployment generation and ReplicaSets unchanged; a manual `kubectl scale` is detected and corrected; retry after rollback is attempt 2 with the same deployment ID; two concurrent deploys give exactly one exit 0 and one exit 4, with consistent state; a downgrade is flagged | Repeated execution |
-| `tests/unit/test_bundle.py` | Semantic-version precedence, using the specification's own ordering example | Repeated execution |
+| `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`, with no write step and the state, Release, Deployment generation and ReplicaSets unchanged; a manual `kubectl scale` is detected and corrected; retry after rollback is attempt 2 with the same deployment ID; two concurrent deploys give exactly one exit 0 and one exit 4, with consistent state; a downgrade is flagged; a 2 s Lease stays held through a slower VERIFY, because every poll renews it | Repeated execution |
 | `tests/e2e/test_recovery.py` | For each crash point (`after-prepare`, `after-deploy`, `during-rollback`): exit 70 leaves `DEPLOYING` and an intent record naming the stage; a deploy while the Lease is live is `LOCKED`; after expiry, the deploy recovers (records the interrupted ID, restores 1.0.0) and then succeeds as attempt 2. `recover`: `LOCKED` while the Lease is live, then `RECOVERED` to the previous release with the Release `Interrupted`; a crashed first deploy recovers to `EMPTY`; with nothing to recover it is a `NO_OP` that writes nothing. | Never ambiguous |
+
+Behaviour the tests cannot reach on their own is shown by `make demo`, and by CI's `e2e` job, which
+runs the tests and the demo against the built wheel.
 
 ## Project layout
 
@@ -572,13 +653,14 @@ deploysim/
   lease.py         Lease acquire, renew, takeover, release; all compare-and-swap
   state.py         state ConfigMap with compare-and-swap
   health.py        rollout verification
-  controller.py    the stage machine
+  outcomes.py      outcomes and exit codes
+  controller.py    deploy and recover: Invocation, Operator, Session
   audit.py         hash-chained JSONL audit log
 crds/release.yaml        Release CRD: schema, CEL rules, printer columns
 kwok/stages.yaml         node and pod Stages, including fault stages
 schemas/                 OpenAPI schemas exported from the pinned cluster version
 examples/                release bundles used by the demo and the walkthrough
-scripts/                 cluster-up.sh, cluster-down.sh, export-schemas.sh, demo.sh
+scripts/                 install-tool.sh, cluster-up.sh, cluster-down.sh, export-schemas.sh, demo.sh
 tests/unit/  tests/e2e/  tests/fixtures/
 .github/workflows/ci.yml
 Makefile                 tool versions and checksums are pinned here
@@ -617,6 +699,17 @@ Three details are deliberate:
 - **`make tools` downloads kwokctl, kwok, kubectl and kubectl-validate by exact version and verifies
   each against a SHA-256 pinned in the `Makefile`.** CI and laptops run identical tools; `bin/` and
   `~/.kwok/cache` are cached between runs.
+
+To check that a wheel came from this workflow on `main`, download the `dist` artifact from a run on
+`main` and verify it:
+
+```sh
+shasum -a 256 -c SHA256SUMS
+gh attestation verify deploysim-0.1.0-py3-none-any.whl --repo rpop12345/deploysim
+```
+
+The attestation is SLSA provenance v1, naming `.github/workflows/ci.yml` on `refs/heads/main` and
+the commit. A modified wheel fails verification.
 
 Failure paths, checked locally:
 - an example bundle with an unknown field fails `manifests`;
@@ -702,5 +795,8 @@ one names where it would plug into deploysim.
   `~/.kwok/cache` itself. Only the kwok controller comes from the verified `bin/kwok`.
 - **Crash detection waits for Lease expiry.** After a crash, the next run is `LOCKED` for up to
   `--lease-seconds`.
+- **The Lease is renewed only while waiting on a rollout.** A run that stalls anywhere else for
+  longer than `--lease-seconds` can be taken over. Its next state write then fails the
+  compare-and-swap, it stops with exit 5, and the next run recovers.
 - **Local audit log.** The hash chain makes tampering detectable, not impossible. Anyone who can
   rewrite the whole file can rebuild the chain; shipping records off-host closes that gap.

@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P10.
+These are checked again at the end of each phase. They have been met for every phase, P0 to P11.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -36,8 +36,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P7 Idempotency, drift and retries | ✅ Done | `206bdf6` (PR #7, merged as `1661258`) |
 | P8 Crash recovery | ✅ Done | `fb15d64` (PR #8, merged as `296a390`) |
 | P9 CLI completeness and demo | ✅ Done | `4076f2f` (PR #9, merged as `38034e6`) |
-| P10 CI complete | ✅ Done | not yet merged (PR #10) |
-| P11 Documentation pass | ⬜ Not started | |
+| P10 CI complete | ✅ Done | `15f45aa`, `6cc599c`, `d49c3ad` (PR #10, merged as `9389d72`) |
+| P11 Documentation pass | ✅ Done | not yet committed |
 
 ## Phase overview
 
@@ -699,16 +699,46 @@ attestation follow the merge.
 
 ## P11: Documentation pass
 
+**Status:** ✅ Done
+
 **Goal:** the README describes the system as built.
 
 **Deliverables**
-- The README tests table includes `test_kube.py`, `test_controller.py` and
-  `test_readme.py`.
-- `--inject-fault` lists the crash points added in P8.
-- Example outputs (summary, audit line, state, `kubectl get releases`) are replaced with real output
-  from `make demo`.
+- Real output in place of every illustrative example, captured from the README walkthrough on a
+  fresh throwaway cluster (`deploysim-docs`):
+  - the deploy summary (the staging rollback, steps without non-rollout `detail`);
+  - the `DEPLOY apply` audit record (formatted, with paths shortened);
+  - the staging `state.json`;
+  - `kubectl get releases -n staging`.
+- Stale text fixed:
+  - the diagram now shows a failed RECOVER;
+  - Lease renewal covers every rollout poll;
+  - `previous` is `last_known_good`;
+  - the first state write is a `create`;
+  - exit 5 covers an unwritable audit log and a lost Lease;
+  - the project layout lists `outcomes.py` and `install-tool.sh`;
+  - the tests table is ordered unit then e2e, and is complete (`test_smoke`, `test_install_tool`
+    and `test_repo` were missing);
+  - CI shows how to verify a wheel's attestation;
+  - Limitations notes that the Lease is renewed only while waiting on a rollout.
+- A misleading message fixed: a failed rollout said "progress deadline exceeded: 3/3 available",
+  counting the old pods. It now says "1 of 3 replicas updated, 3 available".
+- New tests for claims that had none:
+  - `tests/unit/test_repo.py`: actions pinned by SHA; PyYAML the only runtime dependency; every
+    tool pinned for all four platforms; scripts never touch `~/.kube`. Removing `--kubeconfig`
+    from `cluster-down` makes it fail;
+  - `test_environment.py::test_bundle_configmap_immutable_on_server`;
+  - `test_environment.py::test_cluster_lifecycle`, on its own throwaway cluster: create, re-run
+    unchanged, recreate a stopped cluster, refuse another fingerprint, `~/.kube/config` unchanged;
+  - `test_idempotency.py::test_lease_renewed_while_verifying`. Disabling renewal makes it fail.
+- `test_summary_schema` treats `error` as optional, matching the README.
 
 **Definition of done**
-- [ ] A reader following only the README, on a clean macOS or Linux machine, reaches a green `make demo`.
-- [ ] `tests/unit/test_readme.py` passes.
-- [ ] No README claim lacks a test, except the production controls section, which is design only.
+- [x] A reader following only the README, on a clean macOS or Linux machine, reaches a green
+      `make demo`: macOS on fresh throwaway clusters (P9 and P11), Linux in CI's `e2e` job.
+- [x] `tests/unit/test_readme.py` passes.
+- [x] No README claim lacks a test, except the production controls section, which is design only,
+      and the measured `kubectl diff` false-drift rate, an observation from P4.
+
+**Final state:** 174 tests (110 unit, 64 e2e), coverage 96.3%, `make demo` 23 of 23; CI green on
+`main` in about 6 minutes, with verified build provenance.

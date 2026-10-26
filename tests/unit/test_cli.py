@@ -76,7 +76,7 @@ def test_summary_schema(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     summary = json.loads(result.stdout)
-    assert list(summary) == list(example)
+    assert list(summary) == [key for key in example if key != "error"]
     for key, value in summary.items():
         documented = example[key]
         if value is not None and documented is not None:
