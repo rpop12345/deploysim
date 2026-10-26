@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P9.
+These are checked again at the end of each phase. They have been met for P0 to P10.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -36,7 +36,7 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P7 Idempotency, drift and retries | ✅ Done | `206bdf6` (PR #7, merged as `1661258`) |
 | P8 Crash recovery | ✅ Done | `fb15d64` (PR #8, merged as `296a390`) |
 | P9 CLI completeness and demo | ✅ Done | `4076f2f` (PR #9, merged as `38034e6`) |
-| P10 CI complete | ✅ Done locally; ⏳ GitHub run | not yet committed |
+| P10 CI complete | ✅ Done | not yet merged (PR #10) |
 | P11 Documentation pass | ⬜ Not started | |
 
 ## Phase overview
@@ -622,8 +622,8 @@ them all.
 
 ## P10: CI complete
 
-**Status:** ✅ Done locally; the green run on GitHub and the wall time are confirmed on this phase's
-PR
+**Status:** ✅ Done. Green on PR #10 (run 40316922443); the run on `main` and the first provenance
+attestation follow the merge.
 
 **Goal:** the README's CI workflow, running green on GitHub.
 
@@ -660,11 +660,20 @@ PR
 - Correction to P1's finding: kubectl-validate does reject the invalid CRD when validating the
   CRD document. It only accepts it when loading it through `--local-crds`.
 - By your choice, the negative checks were proven locally rather than through throwaway PRs.
+- The first GitHub run found two bugs that never appeared on macOS. Both are fixed in `6cc599c`:
+  - `cluster-up`'s canary pod was rejected because the cluster had not yet created the `default`
+    ServiceAccount. `cluster-up` now waits for it in `kube-system`, `dev`, `staging` and `prod`;
+  - `fsync` on `--audit-log /dev/null` is EINVAL on Linux. `AuditLog.append` now raises
+    `AuditError` (exit 5, no traceback) for any unwritable log, and `manifests` writes to
+    `$RUNNER_TEMP`. Covered by `test_unwritable_log_raises_audit_error` and
+    `test_unwritable_audit_log_exit_5`.
 
 **Definition of done**
-- [ ] The workflow is green on a pull request and on `main` (this phase's PR).
+- [x] The workflow is green on a pull request: PR #10, run 40316922443, all 6 jobs. The run on
+      `main` follows the merge.
 - [x] `actionlint` is clean, and runs in `make lint`.
-- [ ] Full workflow wall time is under 10 minutes (measured on this phase's PR).
+- [x] Full workflow wall time is under 10 minutes: 5 min 37 s. `e2e` took 5 min 1 s, with the
+      cluster up in 11 s, 61 e2e tests in 3 min 11 s and the demo 23 of 23.
 - [x] Each negative check fails the step it names, verified locally:
       - broken example: the `manifests` loop exits 1;
       - stale schemas: `git diff --exit-code` exits 1;
@@ -679,11 +688,11 @@ PR
 
 | Check | Expected | Status |
 |---|---|---|
-| Green run on a PR | All jobs pass | ⏳ this phase's PR |
+| Green run on a PR | All jobs pass | ✅ run 40316922443 |
 | A PR breaking an example bundle | `manifests` fails | ✅ local: exit 1 |
 | A PR with stale `schemas/` | `e2e` fails at `git diff --exit-code` | ✅ local: exit 1 |
 | A PR adding `additionalProperties: false` beside `properties` in the CRD | `manifests` fails (`kubectl-validate crds/`); `e2e` fails at `make cluster-up` | ✅ local: both exit 1 |
-| A PR failing an e2e test | Diagnostics artifacts are uploaded; the cluster is deleted | ⏳ only on a real failing run |
+| A PR failing an e2e test | Diagnostics artifacts are uploaded; the cluster is deleted | ⏳ only on a real failing run; the first run's `e2e` failure deleted the cluster |
 | Replay of the `e2e` job against the wheel | 61 e2e passed; demo 23 of 23 | ✅ |
 
 ---
