@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P5.
+These are checked again at the end of each phase. They have been met for P0 to P6.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -31,8 +31,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P2 Audit log | ✅ Done | `a01f40f` (PR #2, merged as `712c753`) |
 | P3 Bundle loading and offline validation | ✅ Done | `829f0d2` (PR #3, merged as `6b23ac2`) |
 | P4 Kubernetes access layer | ✅ Done | `5794c9c` (PR #4, merged as `87f48ea`) |
-| P5 Deploy, happy path | ✅ Done | not yet committed |
-| P6 Rollback and degraded environments | ⬜ Not started | |
+| P5 Deploy, happy path | ✅ Done | `8bcc598` (PR #5, merged as `7ee0de2`) |
+| P6 Rollback and degraded environments | ✅ Done | not yet committed |
 | P7 Idempotency, drift and retries | ⬜ Not started | |
 | P8 Crash recovery | ⬜ Not started | |
 | P9 CLI completeness and demo | ⬜ Not started | |
@@ -428,34 +428,50 @@ true after P6: exit 2, a `FAIL` VERIFY record, and `current` unchanged.
 
 ## P6: Rollback and degraded environments
 
+**Status:** ✅ Done
+
 **Goal:** a failed `VERIFY` always ends in `ROLLED_BACK` or `ROLLBACK_FAILED`, never in between.
 
 **Deliverables**
-- `ROLLBACK`:
-  - re-apply the last known-good bundle from its ConfigMap, then verify it;
-  - with no previous release, delete the bundle's objects and set `EMPTY`;
-  - when rollback verification fails, set `DEGRADED` and exit 3.
-- `--inject-fault unhealthy` and `--inject-fault unhealthy-rollback` add the fault annotation at
-  apply time only. The stored bundle stays unannotated.
-- The degraded gate and `--allow-degraded`.
-- Release phases `RolledBack` and `RollbackFailed`.
+- `Session.rollback()`, which runs when `VERIFY` fails:
+  - records `in_flight.stage = ROLLBACK`;
+  - with no `last_known_good` (a first deploy), deletes the bundle's objects (`--wait=true`). The
+    environment becomes `EMPTY`, the outcome `ROLLED_BACK` (exit 2), the phase `RolledBack`;
+  - otherwise loads `last_known_good`'s stored objects and its timeout (`load_bundle`),
+    re-applies them, then verifies with that timeout:
+    - check passes: `HEALTHY`, `ROLLED_BACK` (exit 2), phase `RolledBack`;
+    - check fails: `DEGRADED`, `ROLLBACK_FAILED` (exit 3), phase `RollbackFailed`;
+  - always clears `in_flight` and records `last_outcome`. The summary's `rollback` reports
+    `performed`, `to` and `result`.
+- The intent record's `previous` is now `last_known_good`, not `current`, so a rollback always
+  returns to a known-good release, even after a forced deploy into a `DEGRADED` environment.
+- `deploy --inject-fault unhealthy|unhealthy-rollback`. `workload_manifests(objects, app, fault)`
+  annotates Deployment pod templates at apply time only; the stored bundle stays unannotated. The
+  `DEPLOY` and `ROLLBACK` apply records name the fault injected.
+- `VERIFY_FAILED` is removed from `Outcome`. The degraded gate and `--allow-degraded` were built in
+  P5.
 
 **Definition of done**
-- [ ] The P5 `xfail` markers are removed.
-- [ ] After every test, `state.in_flight is None` and `status` is one of `HEALTHY`, `EMPTY` or `DEGRADED`.
-- [ ] All P6 tests pass.
+- [x] No `xfail` markers were needed. P5's `test_verify_failure_stops` now selects VERIFY's
+      `rollout_status` step, since ROLLBACK adds its own.
+- [x] After every rollback test, `state.in_flight is None` and `status` is `HEALTHY`, `EMPTY` or
+      `DEGRADED` (`assert_settled`).
+- [x] All P6 tests pass (86 unit, 43 e2e; three consecutive green `make test` runs; e2e about
+      105 s).
 
 **Tests that must pass** (`tests/e2e/test_rollback.py`)
 
-| Test | Asserts |
-|---|---|
-| `test_unhealthy_upgrade_rolls_back` | Exit 2; `final == from`; Release `RolledBack`; `environment_status` `HEALTHY` |
-| `test_old_pods_keep_serving` | During the failed rollout, the original ReplicaSet never drops below `replicas - maxUnavailable` ready pods |
-| `test_broken_build` | `orders-api-1.2.0` gives exit 2 in dev |
-| `test_first_deploy_unhealthy` | Exit 2; `status` `EMPTY`; no Deployment or Service with the app label remains |
-| `test_rollback_fails` | `unhealthy-rollback` gives exit 3; `status` `DEGRADED`; Release `RollbackFailed` |
-| `test_degraded_gate` | The next deploy gives exit 1; with `--allow-degraded` a healthy release gives exit 0 and `HEALTHY` |
-| `test_stored_bundle_unannotated` | The bundle ConfigMap has no `deploysim.io/fault` after an injected-fault run |
+| Test | Asserts | Status |
+|---|---|---|
+| `test_unhealthy_upgrade_rolls_back` | `--inject-fault unhealthy`: exit 2, `ROLLED_BACK`, `final == from`, rollback `SUCCEEDED` to 1.0.0, `HEALTHY`, phase `RolledBack`; every pod back on the 1.0.0 image | ✅ |
+| `test_old_pods_keep_serving` | Pods sampled every 0.2 s during the failed rollout: faulty pods appeared, and ready pods of the original ReplicaSet never dropped below `replicas - maxUnavailable` (4 - 1) | ✅ |
+| `test_broken_build` | A fault in the bundle itself rolls back to 1.0.0 (exit 2, `HEALTHY`); that stored bundle does carry the annotation | ✅ |
+| `test_first_deploy_unhealthy` | Exit 2; rollback to `None`; `EMPTY`; no Deployment or Service with the app label remains; phase `RolledBack` | ✅ |
+| `test_rollback_fails` | `unhealthy-rollback`: exit 3, `ROLLBACK_FAILED`, rollback `FAILED` to 1.0.0, `DEGRADED`, phase `RollbackFailed`; one ROLLBACK `rollout_status` `FAIL` | ✅ |
+| `test_degraded_gate` | After a real failed rollback: the next deploy gives exit 1 `environment:DEGRADED`; with `--allow-degraded`, exit 0 and `HEALTHY` on 1.1.0 | ✅ |
+| `test_stored_bundle_unannotated` | The bundle ConfigMap of an injected-fault release has no `deploysim.io/fault`; the DEPLOY record shows `injected_fault: unhealthy` | ✅ |
+| `tests/unit/test_controller.py::test_fault_injected_only_into_pod_templates` | Only Deployment pod templates gain the annotation; the bundle and its ConfigMap stay clean | ✅ |
+| `tests/unit/test_controller.py::test_fault_targets` | `unhealthy` faults the target only; `unhealthy-rollback` faults both | ✅ |
 
 ---
 

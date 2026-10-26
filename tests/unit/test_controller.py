@@ -5,6 +5,7 @@ from pathlib import Path
 
 from deploysim.bundle import Bundle, parse_documents
 from deploysim.controller import (
+    DeployRequest,
     bundle_configmap,
     deployment_id,
     release_manifest,
@@ -44,7 +45,7 @@ def test_in_cluster_manifests_carry_labels_and_digest() -> None:
 
     release = release_manifest(bundle)
     stored = bundle_configmap(bundle)
-    workloads = workload_manifests(bundle)
+    workloads = workload_manifests(bundle.objects, bundle.app)
 
     assert release["metadata"]["annotations"]["deploysim.io/bundle-digest"] == bundle.digest
     assert release["spec"]["healthCheck"] == {"timeoutSeconds": 60}
@@ -59,8 +60,30 @@ def test_outcome_exit_codes() -> None:
     assert Outcome.SUCCEEDED.exit_code == ExitCode.SUCCESS
     assert Outcome.NO_OP.exit_code == ExitCode.SUCCESS
     assert Outcome.REJECTED.exit_code == ExitCode.REJECTED
-    assert Outcome.VERIFY_FAILED.exit_code == ExitCode.ROLLED_BACK
     assert Outcome.ROLLED_BACK.exit_code == ExitCode.ROLLED_BACK
     assert Outcome.ROLLBACK_FAILED.exit_code == ExitCode.ROLLBACK_FAILED
     assert Outcome.LOCKED.exit_code == ExitCode.LOCKED
     assert Outcome.ENVIRONMENT_ERROR.exit_code == ExitCode.ENVIRONMENT_ERROR
+
+
+def test_fault_injected_only_into_pod_templates() -> None:
+    bundle = example()
+
+    faulty = workload_manifests(bundle.objects, bundle.app, "unhealthy")
+
+    [deployment] = [m for m in faulty if m["kind"] == "Deployment"]
+    template = deployment["spec"]["template"]["metadata"]
+    assert template["annotations"]["deploysim.io/fault"] == "unhealthy"
+    assert all("deploysim.io/fault" not in str(m) for m in faulty if m["kind"] != "Deployment")
+    assert "deploysim.io/fault" not in str(bundle.objects)
+    assert "deploysim.io/fault" not in str(bundle_configmap(bundle))
+
+
+def test_fault_targets() -> None:
+    plain = DeployRequest(EXAMPLE, "dev")
+    target = DeployRequest(EXAMPLE, "dev", inject_fault="unhealthy")
+    both = DeployRequest(EXAMPLE, "dev", inject_fault="unhealthy-rollback")
+
+    assert (plain.target_fault, plain.rollback_fault) == (None, None)
+    assert (target.target_fault, target.rollback_fault) == ("unhealthy", None)
+    assert (both.target_fault, both.rollback_fault) == ("unhealthy", "unhealthy")

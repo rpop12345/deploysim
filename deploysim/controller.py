@@ -7,7 +7,7 @@ import hashlib
 import json
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +38,9 @@ from deploysim.validate import validate_file
 ENVIRONMENTS = ("dev", "staging", "prod")
 RELEASES = "releases.deploysim.io"
 DIGEST_ANNOTATION = "deploysim.io/bundle-digest"
+FAULT_ANNOTATION = "deploysim.io/fault"
 BUNDLE_KEY = "objects.json"
+FAULTS = ("unhealthy", "unhealthy-rollback")
 
 Detail = dict[str, Any]
 
@@ -53,8 +55,12 @@ def deployment_id(bundle: Bundle, environment: str) -> str:
     return "dep-" + hashlib.sha256(material.encode()).hexdigest()[:12]
 
 
+def stored_bundle_name(app: str, version: str) -> str:
+    return f"deploysim-{app}-{version}"
+
+
 def bundle_configmap_name(bundle: Bundle) -> str:
-    return f"deploysim-{bundle.app}-{bundle.version}"
+    return stored_bundle_name(bundle.app, bundle.version)
 
 
 def release_manifest(bundle: Bundle) -> Manifest:
@@ -85,15 +91,25 @@ def bundle_configmap(bundle: Bundle) -> Manifest:
     }
 
 
-def workload_manifests(bundle: Bundle) -> list[Manifest]:
-    """Bundle objects with deploysim's labels added."""
+def workload_manifests(
+    objects: Iterable[Manifest], app: str, fault: str | None = None
+) -> list[Manifest]:
+    """Copies with deploysim's labels; fault, if set, annotates every Deployment pod template."""
     manifests = []
-    for obj in bundle.objects:
+    for obj in objects:
         manifest = copy.deepcopy(obj)
         metadata = manifest.setdefault("metadata", {})
-        metadata["labels"] = {**(metadata.get("labels") or {}), **managed_labels(bundle.app)}
+        metadata["labels"] = {**(metadata.get("labels") or {}), **managed_labels(app)}
+        if fault and manifest.get("kind") == "Deployment":
+            template = manifest["spec"]["template"].setdefault("metadata", {})
+            annotations = template.get("annotations") or {}
+            template["annotations"] = {**annotations, FAULT_ANNOTATION: fault}
         manifests.append(manifest)
     return manifests
+
+
+def deployment_names(objects: Iterable[Manifest]) -> list[str]:
+    return [obj["metadata"]["name"] for obj in objects if obj.get("kind") == "Deployment"]
 
 
 def describe_object(obj: Manifest) -> str:
@@ -112,7 +128,16 @@ class DeployRequest:
     environment: str
     allow_degraded: bool = False
     lease_seconds: int = 30
+    inject_fault: str | None = None
     holder: str = field(default_factory=default_holder)
+
+    @property
+    def target_fault(self) -> str | None:
+        return "unhealthy" if self.inject_fault in FAULTS else None
+
+    @property
+    def rollback_fault(self) -> str | None:
+        return "unhealthy" if self.inject_fault == "unhealthy-rollback" else None
 
 
 @dataclass(frozen=True)
@@ -144,6 +169,7 @@ class Run:
         self.to_release: str | None = None
         self.final_release: str | None = None
         self.environment_status: Status | None = None
+        self.rollback: Detail = {"performed": False, "to": None, "result": None}
         self.steps: list[Detail] = []
 
     def record(
@@ -183,7 +209,7 @@ class Run:
             "from": self.from_release,
             "to": self.to_release,
             "outcome": ending.outcome.value,
-            "rollback": {"performed": False, "to": None, "result": None},
+            "rollback": self.rollback,
             "final": self.final_release,
             "environment_status": self.environment_status,
             "started_at": iso_millis(self.started),
@@ -288,8 +314,7 @@ class Deploy:
         session.deploy()
         verification = session.verify()
         if not verification.ok:
-            error = f"health check failed: {verification.reason}"
-            return Ending(Outcome.VERIFY_FAILED, error=error)
+            return session.rollback(verification)
         session.complete()
         return Ending(Outcome.SUCCEEDED)
 
@@ -384,7 +409,7 @@ class Session:
         manifests = [
             release_manifest(self.bundle),
             bundle_configmap(self.bundle),
-            *workload_manifests(self.bundle),
+            *workload_manifests(self.bundle.objects, self.bundle.app),
         ]
         try:
             result = self.env.apply(manifests, dry_run=True)
@@ -473,10 +498,11 @@ class Session:
         run_id, attempt = run.deployment_id or "", run.attempt or 1
         target = ReleaseRef(bundle.name, bundle.version, bundle.image)
         started = iso_millis(self.ctl.clock())
-        in_flight = InFlight(run_id, attempt, target, state.current, "PREPARE", started)
+        previous = state.last_known_good
+        in_flight = InFlight(run_id, attempt, target, previous, "PREPARE", started)
         detail = {
             "target": bundle.name,
-            "previous": state.current.release if state.current else None,
+            "previous": previous.release if previous else None,
             "replaced_in_flight": state.in_flight.deployment_id if state.in_flight else None,
         }
         attempts = {**state.attempts, run_id: attempt}
@@ -516,25 +542,32 @@ class Session:
     # DEPLOY ---------------------------------------------------------------------------------
 
     def deploy(self) -> None:
-        manifests = workload_manifests(self.bundle)
+        fault = self.request.target_fault
+        manifests = workload_manifests(self.bundle.objects, self.bundle.app, fault)
         result = self.env.apply(manifests)
-        detail = {"objects": [describe_object(m) for m in manifests]}
+        detail = {"objects": [describe_object(m) for m in manifests], "injected_fault": fault}
         self.run.record("DEPLOY", "apply", "OK", cmd=result.cmd, detail=detail)
+        self._advance("DEPLOY")
+
+    def _advance(self, stage: str) -> None:
         in_flight = self.stored.state.in_flight
         if in_flight:
-            advanced = replace(in_flight, stage="DEPLOY")
-            self._save("DEPLOY", "record_stage", {"stage": "DEPLOY"}, in_flight=advanced)
+            advanced = replace(in_flight, stage=stage)
+            self._save(stage, "record_stage", {"stage": stage}, in_flight=advanced)
 
     # VERIFY ---------------------------------------------------------------------------------
 
     def verify(self) -> Verification:
         self.run.final_release = self.bundle.name
         self._release_phase("VERIFY", "Verifying", "waiting for the rollout")
-        names = [deployment["metadata"]["name"] for deployment in self.bundle.deployments]
+        names = deployment_names(self.bundle.objects)
+        return self._await_rollout("VERIFY", names, self.bundle.timeout_seconds)
+
+    def _await_rollout(self, stage: str, names: list[str], timeout: float) -> Verification:
         verification = verify(
             self.env,
             names,
-            self.bundle.timeout_seconds,
+            timeout,
             clock=self.ctl.clock,
             sleep=self.ctl.sleep,
             interval=self.ctl.poll_seconds,
@@ -542,8 +575,86 @@ class Session:
         )
         result = "OK" if verification.ok else "FAIL"
         detail = verification.detail()
-        self.run.record("VERIFY", "rollout_status", result, cmd=verification.cmd, detail=detail)
+        self.run.record(stage, "rollout_status", result, cmd=verification.cmd, detail=detail)
         return verification
+
+    # ROLLBACK -------------------------------------------------------------------------------
+
+    def rollback(self, failed: Verification) -> Ending:
+        """Restores last_known_good and verifies it; on a first deploy, removes the objects."""
+        in_flight = self.stored.state.in_flight
+        if in_flight is None:
+            raise RuntimeError("ROLLBACK without an intent record")
+        self._advance("ROLLBACK")
+        reason = f"health check failed: {failed.reason}"
+        previous = in_flight.previous
+        if previous is None:
+            for manifest in workload_manifests(self.bundle.objects, self.bundle.app):
+                kind, name = manifest["kind"], manifest["metadata"]["name"]
+                result = self.env.delete(kind, name, wait=True)
+                removed: Detail = {"object": f"{kind}/{name}"}
+                self.run.record("ROLLBACK", "delete", "OK", cmd=result.cmd, detail=removed)
+            message = "nothing to restore; objects removed"
+            self._conclude(Status.EMPTY, None, Outcome.ROLLED_BACK, message)
+            return Ending(Outcome.ROLLED_BACK, error=f"{reason}; first deployment removed")
+
+        objects, timeout = self._load_bundle(previous)
+        fault = self.request.rollback_fault
+        manifests = workload_manifests(objects, self.bundle.app, fault)
+        result = self.env.apply(manifests)
+        detail = {
+            "to": previous.release,
+            "objects": [describe_object(m) for m in manifests],
+            "injected_fault": fault,
+        }
+        self.run.record("ROLLBACK", "apply", "OK", cmd=result.cmd, detail=detail)
+        restored = self._await_rollout("ROLLBACK", deployment_names(objects), timeout)
+        if restored.ok:
+            message = f"rolled back to {previous.release}"
+            self._conclude(Status.HEALTHY, previous, Outcome.ROLLED_BACK, message)
+            return Ending(Outcome.ROLLED_BACK, error=f"{reason}; rolled back to {previous.release}")
+        message = f"rollback to {previous.release} failed: {restored.reason}"
+        self._conclude(Status.DEGRADED, previous, Outcome.ROLLBACK_FAILED, message)
+        return Ending(Outcome.ROLLBACK_FAILED, error=f"{reason}; {message}")
+
+    def _load_bundle(self, ref: ReleaseRef) -> tuple[list[Manifest], int]:
+        """The stored objects of an earlier release and its health check timeout."""
+        name = stored_bundle_name(self.bundle.app, ref.version)
+        stored = self.env.get("configmap", name)
+        objects: list[Manifest] = json.loads(stored.json()["data"][BUNDLE_KEY])
+        release = self.env.get(RELEASES, ref.release).json()
+        timeout = int(release["spec"]["healthCheck"]["timeoutSeconds"])
+        detail = {"configmap": name, "objects": len(objects), "timeout_s": timeout}
+        self.run.record("ROLLBACK", "load_bundle", "OK", cmd=stored.cmd, detail=detail)
+        return objects, timeout
+
+    def _conclude(
+        self, status: Status, current: ReleaseRef | None, outcome: Outcome, message: str
+    ) -> None:
+        in_flight = self.stored.state.in_flight
+        if in_flight is None:
+            raise RuntimeError("ROLLBACK without an intent record")
+        result = "SUCCEEDED" if outcome == Outcome.ROLLED_BACK else "FAILED"
+        last = LastOutcome(in_flight.deployment_id, in_flight.attempt, outcome)
+        detail = {"current": current.release if current else None, "status": status}
+        self._save(
+            "ROLLBACK",
+            "record_outcome",
+            detail,
+            status=status,
+            current=current,
+            in_flight=None,
+            last_outcome=last,
+        )
+        phase = "RolledBack" if outcome == Outcome.ROLLED_BACK else "RollbackFailed"
+        self._release_phase("ROLLBACK", phase, message)
+        self.run.environment_status = status
+        self.run.final_release = current.release if current else None
+        self.run.rollback = {
+            "performed": True,
+            "to": current.release if current else None,
+            "result": result,
+        }
 
     # COMPLETE -------------------------------------------------------------------------------
 

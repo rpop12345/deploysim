@@ -183,22 +183,49 @@ class CliRun:
     stderr: str
 
 
-def deploysim(*args: str, audit_log: Path) -> CliRun:
-    """Runs the deploysim CLI from the repository root and parses its JSON summary."""
+def start_deploysim(*args: str, audit_log: Path) -> subprocess.Popen[str]:
+    """Starts the deploysim CLI from the repository root; finish() collects the result."""
     env = {**os.environ, "DEPLOYSIM_ROOT": str(REPO)}
-    result = subprocess.run(
+    return subprocess.Popen(
         [sys.executable, "-m", "deploysim", *args, "--audit-log", str(audit_log)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=env,
         cwd=REPO,
-        check=False,
     )
+
+
+def finish(process: subprocess.Popen[str]) -> CliRun:
+    stdout, stderr = process.communicate(timeout=300)
     try:
-        summary: Manifest = json.loads(result.stdout)
+        summary: Manifest = json.loads(stdout)
     except json.JSONDecodeError:
         summary = {}
-    return CliRun(result.returncode, summary, result.stderr)
+    return CliRun(process.returncode, summary, stderr)
+
+
+def deploysim(*args: str, audit_log: Path) -> CliRun:
+    """Runs the deploysim CLI and parses its JSON summary."""
+    return finish(start_deploysim(*args, audit_log=audit_log))
+
+
+CLEANUP_KINDS = "deployments,services,configmaps,releases.deploysim.io,leases"
+
+
+def delete_app(kubectl: Kubectl, app: str) -> None:
+    """Deletes everything carrying the app's name label in every environment."""
+    for namespace in ENVIRONMENTS:
+        kubectl.run(
+            "delete",
+            CLEANUP_KINDS,
+            "-n",
+            namespace,
+            "-l",
+            f"{NAME_LABEL}={app}",
+            "--ignore-not-found",
+            "--wait=false",
+        )
 
 
 def state_of(kubectl: Kubectl, app: str, namespace: str) -> Manifest:

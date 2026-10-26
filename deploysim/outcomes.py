@@ -19,7 +19,6 @@ class Outcome(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     NO_OP = "NO_OP"
     REJECTED = "REJECTED"
-    VERIFY_FAILED = "VERIFY_FAILED"
     ROLLED_BACK = "ROLLED_BACK"
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
     LOCKED = "LOCKED"
@@ -34,7 +33,6 @@ _EXIT_CODES = {
     Outcome.SUCCEEDED: ExitCode.SUCCESS,
     Outcome.NO_OP: ExitCode.SUCCESS,
     Outcome.REJECTED: ExitCode.REJECTED,
-    Outcome.VERIFY_FAILED: ExitCode.ROLLED_BACK,
     Outcome.ROLLED_BACK: ExitCode.ROLLED_BACK,
     Outcome.ROLLBACK_FAILED: ExitCode.ROLLBACK_FAILED,
     Outcome.LOCKED: ExitCode.LOCKED,

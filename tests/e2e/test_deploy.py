@@ -132,7 +132,8 @@ def test_verify_failure_stops(kubectl: Kubectl, app: str, tmp_path: Path, deploy
     result = deploy(broken, "dev")
 
     assert result.code == 2, result.stderr
-    [verify] = [s for s in result.summary["steps"] if s["action"] == "rollout_status"]
+    steps = result.summary["steps"]
+    [verify] = [s for s in steps if (s["stage"], s["action"]) == ("VERIFY", "rollout_status")]
     assert verify["result"] == "FAIL"
     assert verify["detail"]["reason"] == "ProgressDeadlineExceeded"
     assert state_of(kubectl, app, "dev")["current"]["release"] == f"{app}-1.0.0"
