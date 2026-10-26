@@ -264,7 +264,7 @@ hand. The audit record marks it `"downgrade": true`.
 | `DEPLOY` | `kubectl apply --server-side --field-manager=deploysim --force-conflicts` of the workload objects, each labelled `app.kubernetes.io/managed-by: deploysim`. |
 | `VERIFY` | Polls every Deployment in the bundle every 0.5 s and renews the Lease on each poll. It passes when the rollout is complete, by the same rule `kubectl rollout status` uses: `observedGeneration` is current, no old replicas remain, and the updated and available replica counts equal `replicas`. It fails as soon as the `Progressing` condition reports `ProgressDeadlineExceeded`, or when `healthCheck.timeoutSeconds` elapses. |
 | `COMPLETE` | Sets `current` and `last_known_good` to the target, clears `in_flight`, and sets the Release phase to `Succeeded`. |
-| `ROLLBACK` | Re-applies the last known-good bundle from its immutable ConfigMap and verifies it the same way. On a first deployment there is nothing to restore: the bundle's objects are deleted and the environment returns to `EMPTY`. |
+| `ROLLBACK` | Re-applies the `last_known_good` release's bundle from its immutable ConfigMap and verifies it the same way, with that release's own `healthCheck.timeoutSeconds`. If that check passes, the outcome is `ROLLED_BACK` (exit 2) and the Release phase `RolledBack`. If it fails, the outcome is `ROLLBACK_FAILED` (exit 3), the environment is `DEGRADED`, and the phase is `RollbackFailed`. On a first deployment there is nothing to restore: the bundle's objects are deleted and the environment returns to `EMPTY`. |
 
 Rollback re-applies the known-good bundle rather than running `kubectl rollout undo`. `rollout undo`
 only reverts the pod template, never the Services and ConfigMaps alongside it. It also depends on
@@ -292,13 +292,17 @@ The annotation can be set in two places:
 | `unhealthy-rollback` | Annotates the rollback too, so the environment ends `DEGRADED` |
 | `crash-after-deploy` | The process exits immediately after `DEPLOY` without releasing the Lease, leaving an intent record for the next run |
 
+The CLI adds the annotation only to the manifests it applies. The bundle stored for rollback never
+carries it, so a later rollback to that release is healthy. The `DEPLOY` and `ROLLBACK` audit
+records name any fault injected.
+
 ## In-cluster records
 
 All state lives in the cluster, in the environment's namespace, so any runner sees the same truth.
 
 | Object | Name | Holds |
 |---|---|---|
-| `Release` (deploysim.io/v1alpha1) | `<app>-<version>` | What was asked for, annotated `deploysim.io/bundle-digest`, and its status: phase (`Deploying`, `Verifying`, `Succeeded`, …), attempts, deployment ID, message, last transition |
+| `Release` (deploysim.io/v1alpha1) | `<app>-<version>` | What was asked for, annotated `deploysim.io/bundle-digest`, and its status: phase (`Deploying`, `Verifying`, `Succeeded`, `RolledBack`, `RollbackFailed`, `Interrupted`), attempts, deployment ID, message, last transition |
 | `ConfigMap`, immutable | `deploysim-<app>-<version>` | The workload objects under `objects.json`, annotated with the bundle digest, used for rollback |
 | `ConfigMap` | `deploysim-<app>` | Controller state: `current`, `last_known_good`, `in_flight`, `attempts`, `status` |
 | `Lease` | `deploysim-<app>` | The lock: holder, duration, renew time |
@@ -508,7 +512,7 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 | `tests/unit/test_health.py` | Rollout decision for every state (unobserved, updating, terminating, unavailable, complete, deadline exceeded); the VERIFY loop waits, fails fast on the deadline, and times out | Simulated health check |
 | `tests/e2e/test_deploy.py` | First deployment (Release, state, bundle ConfigMap, Lease released, labels); upgrade replaces every pod; promotion dev → staging → prod; `slow-start` succeeds after waiting; audit trail in stage order with commands; a failed health check exits 2 and leaves `current` untouched | Successful deployment, failed health check |
 | `tests/e2e/test_rejections.py` | An invalid bundle creates nothing; the promotion gate rejects a release new to staging and a changed bundle; reusing a version with a different image or manifests is rejected; a held Lease gives exit 4 and changes nothing; a `DEGRADED` environment needs `--allow-degraded` | Invalid input, repeated execution |
-| `tests/e2e/test_rollback.py` | Unhealthy upgrade rolls back to the previous release and old pods keep serving; unhealthy first deployment returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3 | Failed health check, rollback |
+| `tests/e2e/test_rollback.py` | `--inject-fault unhealthy` upgrade rolls back to the previous release, and its pods keep serving: ready old pods never drop below `replicas - maxUnavailable`, sampled throughout; the stored bundle stays unannotated; a broken build (fault in the bundle) rolls back; an unhealthy first deployment removes its objects and returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3; a `DEGRADED` environment needs `--allow-degraded`. After every scenario there is no `in_flight` record. | Failed health check, rollback |
 | `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`; manual drift is corrected; retry after rollback is attempt 2; a concurrent run gets `LOCKED` and changes nothing | Repeated execution |
 | `tests/e2e/test_recovery.py` | `crash-after-deploy`, then the next `deploy` (and separately `recover`) restores the last known-good release and marks the attempt `Interrupted` | Never ambiguous |
 

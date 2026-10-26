@@ -11,7 +11,7 @@ from typing import Any
 
 from deploysim import __version__
 from deploysim.audit import AuditError, AuditLog, Entry
-from deploysim.controller import ENVIRONMENTS, RELEASES, Controller, DeployRequest
+from deploysim.controller import ENVIRONMENTS, FAULTS, RELEASES, Controller, DeployRequest
 from deploysim.errors import EnvironmentProblem
 from deploysim.health import rollout_status
 from deploysim.kube import Kubectl, KubeError
@@ -53,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     deploy.add_argument(
         "--lease-seconds", type=int, default=30, help="lock duration, renewed while running"
     )
+    deploy.add_argument(
+        "--inject-fault", choices=FAULTS, help="make the target, or target and rollback, unhealthy"
+    )
 
     status = commands.add_parser("status", parents=[common], help="show state and live rollout")
     status.add_argument("--app", required=True)
@@ -73,7 +76,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "validate":
             return validate_command(args.file, paths, audit)
         if args.command == "deploy":
-            request = DeployRequest(args.file, args.env, args.allow_degraded, args.lease_seconds)
+            request = DeployRequest(
+                args.file,
+                args.env,
+                allow_degraded=args.allow_degraded,
+                lease_seconds=args.lease_seconds,
+                inject_fault=args.inject_fault,
+            )
             report = Controller(paths, audit, kubeconfig=args.kubeconfig).deploy(request)
             emit(report.summary)
             return report.outcome.exit_code

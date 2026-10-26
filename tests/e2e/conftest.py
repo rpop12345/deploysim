@@ -6,16 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.support import (
-    ENVIRONMENTS,
-    KUBECONFIG,
-    NAME_LABEL,
-    CliRun,
-    Kubectl,
-    deploysim,
-)
-
-CLEANUP_KINDS = "deployments,services,configmaps,releases.deploysim.io,leases"
+from tests.e2e.support import KUBECONFIG, CliRun, Kubectl, delete_app, deploysim
 
 
 @pytest.fixture(scope="session")
@@ -32,17 +23,7 @@ def kubectl() -> Kubectl:
 def app(kubectl: Kubectl) -> Iterator[str]:
     name = f"t-{secrets.token_hex(3)}"
     yield name
-    for namespace in ENVIRONMENTS:
-        kubectl.run(
-            "delete",
-            CLEANUP_KINDS,
-            "-n",
-            namespace,
-            "-l",
-            f"{NAME_LABEL}={name}",
-            "--ignore-not-found",
-            "--wait=false",
-        )
+    delete_app(kubectl, name)
 
 
 @pytest.fixture
