@@ -260,7 +260,7 @@ semantic-version precedence, so `1.0.0-rc.1` < `1.0.0` < `1.10.0`.
 | Stage | What it does |
 |---|---|
 | `LOCK` | Creates the `Lease` `deploysim-<app>` in the environment namespace. A Lease held by a live run gives `LOCKED`. An expired Lease is taken over with a compare-and-swap write, and the takeover is audited. The Lease is renewed on every `VERIFY` poll. |
-| `RECOVER` | Runs when the state still has an `in_flight` record but no live run holds the Lease, which means the previous run died. Rolls back to that record's `previous` release and marks the interrupted attempt `Interrupted`. |
+| `RECOVER` | Runs when the state still has an `in_flight` record but no live run holds the Lease, which means the previous run died. It re-applies that record's `previous` release and verifies it. If there was no previous release, it deletes the target's stored objects and the environment becomes `EMPTY`. It then clears `in_flight`, records the attempt as `INTERRUPTED`, and sets the target Release's phase to `Interrupted`. If the restored release fails its check, the environment becomes `DEGRADED`, the outcome is `ROLLBACK_FAILED` (exit 3), and the requested deploy does not run. |
 | `PREPARE` | Writes `in_flight` (deployment ID, attempt, target, previous, stage) to the state ConfigMap. Stores the bundle in an immutable ConfigMap. Applies the `Release` and sets its phase to `Deploying`. All of this happens before the workload changes, so a crash at any later point is recoverable. |
 | `DEPLOY` | `kubectl apply --server-side --field-manager=deploysim --force-conflicts` of the workload objects, each labelled `app.kubernetes.io/managed-by: deploysim`. |
 | `VERIFY` | Polls every Deployment in the bundle every 0.5 s and renews the Lease on each poll. It passes when the rollout is complete, by the same rule `kubectl rollout status` uses: `observedGeneration` is current, no old replicas remain, and the updated and available replica counts equal `replicas`. It fails as soon as the `Progressing` condition reports `ProgressDeadlineExceeded`, or when `healthCheck.timeoutSeconds` elapses. |
@@ -291,7 +291,13 @@ The annotation can be set in two places:
 |---|---|
 | `unhealthy` | Annotates the target's pod template, so this deployment rolls back |
 | `unhealthy-rollback` | Annotates the rollback too, so the environment ends `DEGRADED` |
-| `crash-after-deploy` | The process exits immediately after `DEPLOY` without releasing the Lease, leaving an intent record for the next run |
+| `crash-after-prepare` | The process exits (code 70) right after `PREPARE`. The intent record and stored bundle are written; the workload is untouched. |
+| `crash-after-deploy` | The process exits (code 70) right after `DEPLOY`. The workload has changed but was never verified. |
+| `crash-during-rollback` | Makes the target unhealthy, then exits (code 70) right after the rollback's apply, before it is verified |
+
+Every crash leaves the Lease held and the intent record in place, exactly as a killed process
+would. The next `deploy` or `recover` after the Lease expires (`--lease-seconds`) resolves it. An
+`inject_crash` audit record marks where the run stopped.
 
 The CLI adds the annotation only to the manifests it applies. The bundle stored for rollback never
 carries it, so a later rollback to that release is healthy. The `DEPLOY` and `ROLLBACK` audit
@@ -347,7 +353,7 @@ image. The immutable bundle ConfigMap rejects re-using a version for different m
 ```
 deploysim validate RELEASE_FILE
 deploysim deploy   RELEASE_FILE --env ENV [--inject-fault FAULT] [--allow-degraded] [--lease-seconds N]
-deploysim recover  --app APP --env ENV
+deploysim recover  --app APP --env ENV [--lease-seconds N]
 deploysim status   --app APP --env ENV
 deploysim history  [--app APP] [--env ENV] [--deployment-id ID] [--verify]
 ```
@@ -363,7 +369,9 @@ What each command does:
 - `validate` runs pass 1 only. It needs no cluster.
 - `deploy` runs the full pipeline. It prints a JSON summary on stdout and one progress line per
   audit record on stderr, for example `deploysim: VERIFY    rollout_status   OK`.
-- `recover` resolves an interrupted deployment without starting a new one.
+- `recover` resolves an interrupted deployment without starting a new one. It ends `RECOVERED`
+  (exit 0), or `NO_OP` (exit 0) when there is nothing to recover, or `ROLLBACK_FAILED` (exit 3)
+  when the restored release is unhealthy. A live Lease gives `LOCKED` (exit 4).
 - `status` prints, as JSON, the state ConfigMap, every Release of the app in that environment with
   its phase, and the live rollout status of its Deployments.
 - `history` prints audit records. `--verify` checks the hash chain and sequence numbers.
@@ -381,6 +389,7 @@ What each command does:
   "from": "orders-api-1.0.0",
   "to": "orders-api-1.1.0",
   "outcome": "ROLLED_BACK",
+  "recovery": { "performed": false, "interrupted": null, "to": null, "result": null },
   "rollback": { "performed": true, "to": "orders-api-1.0.0", "result": "SUCCEEDED" },
   "drift_corrected": false,
   "final": "orders-api-1.0.0",
@@ -429,13 +438,14 @@ Each record is flushed and fsynced before the next action starts.
 
 | Code | Outcome |
 |---|---|
-| 0 | `SUCCEEDED` or `NO_OP` |
+| 0 | `SUCCEEDED`, `NO_OP` or `RECOVERED` |
 | 1 | `REJECTED`: validation failed, nothing changed |
 | 2 | `ROLLED_BACK`: health check failed, previous release restored and healthy |
 | 3 | `ROLLBACK_FAILED`: environment `DEGRADED`, operator action needed |
 | 4 | `LOCKED`: another live run holds the Lease |
 | 5 | `ENVIRONMENT_ERROR`: missing tool, unreachable cluster, or safety guard refused. If it happens mid-deployment, the next run recovers. |
 | 64 | Usage error (`EX_USAGE`, so it never collides with 2) |
+| 70 | Simulated crash (`--inject-fault crash-*`). Nothing is cleaned up; the next run recovers. |
 
 ## Retry and recovery
 
@@ -519,7 +529,7 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 | `tests/e2e/test_rollback.py` | `--inject-fault unhealthy` upgrade rolls back to the previous release, and its pods keep serving: ready old pods never drop below `replicas - maxUnavailable`, sampled throughout; the stored bundle stays unannotated; a broken build (fault in the bundle) rolls back; an unhealthy first deployment removes its objects and returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3; a `DEGRADED` environment needs `--allow-degraded`. After every scenario there is no `in_flight` record. | Failed health check, rollback |
 | `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`, with no write step and the state, Release, Deployment generation and ReplicaSets unchanged; a manual `kubectl scale` is detected and corrected; retry after rollback is attempt 2 with the same deployment ID; two concurrent deploys give exactly one exit 0 and one exit 4, with consistent state; a downgrade is flagged | Repeated execution |
 | `tests/unit/test_bundle.py` | Semantic-version precedence, using the specification's own ordering example | Repeated execution |
-| `tests/e2e/test_recovery.py` | `crash-after-deploy`, then the next `deploy` (and separately `recover`) restores the last known-good release and marks the attempt `Interrupted` | Never ambiguous |
+| `tests/e2e/test_recovery.py` | For each crash point (`after-prepare`, `after-deploy`, `during-rollback`): exit 70 leaves `DEPLOYING` and an intent record naming the stage; a deploy while the Lease is live is `LOCKED`; after expiry, the deploy recovers (records the interrupted ID, restores 1.0.0) and then succeeds as attempt 2. `recover`: `LOCKED` while the Lease is live, then `RECOVERED` to the previous release with the Release `Interrupted`; a crashed first deploy recovers to `EMPTY`; with nothing to recover it is a `NO_OP` that writes nothing. | Never ambiguous |
 
 ## Project layout
 

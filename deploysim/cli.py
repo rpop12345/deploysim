@@ -11,7 +11,14 @@ from typing import Any
 
 from deploysim import __version__
 from deploysim.audit import AuditError, AuditLog, Entry
-from deploysim.controller import ENVIRONMENTS, FAULTS, RELEASES, Controller, DeployRequest
+from deploysim.controller import (
+    ENVIRONMENTS,
+    FAULTS,
+    RELEASES,
+    Controller,
+    DeployRequest,
+    RecoverRequest,
+)
 from deploysim.errors import EnvironmentProblem
 from deploysim.health import rollout_status
 from deploysim.kube import Kubectl, KubeError
@@ -57,6 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--inject-fault", choices=FAULTS, help="make the target, or target and rollback, unhealthy"
     )
 
+    recover = commands.add_parser(
+        "recover", parents=[common], help="resolve an interrupted deployment"
+    )
+    recover.add_argument("--app", required=True)
+    recover.add_argument("--env", required=True, choices=ENVIRONMENTS)
+    recover.add_argument(
+        "--lease-seconds", type=int, default=30, help="lock duration, renewed while running"
+    )
+
     status = commands.add_parser("status", parents=[common], help="show state and live rollout")
     status.add_argument("--app", required=True)
     status.add_argument("--env", required=True, choices=ENVIRONMENTS)
@@ -84,6 +100,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 inject_fault=args.inject_fault,
             )
             report = Controller(paths, audit, kubeconfig=args.kubeconfig).deploy(request)
+            emit(report.summary)
+            return report.outcome.exit_code
+        if args.command == "recover":
+            recovery = RecoverRequest(args.app, args.env, lease_seconds=args.lease_seconds)
+            report = Controller(paths, audit, kubeconfig=args.kubeconfig).recover(recovery)
             emit(report.summary)
             return report.outcome.exit_code
         return status_command(args.app, args.env, paths, args.kubeconfig)

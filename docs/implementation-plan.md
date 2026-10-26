@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P7.
+These are checked again at the end of each phase. They have been met for P0 to P8.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -33,8 +33,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P4 Kubernetes access layer | ✅ Done | `5794c9c` (PR #4, merged as `87f48ea`) |
 | P5 Deploy, happy path | ✅ Done | `8bcc598` (PR #5, merged as `7ee0de2`) |
 | P6 Rollback and degraded environments | ✅ Done | `e4a0f66` (PR #6, merged as `bad0cf1`) |
-| P7 Idempotency, drift and retries | ✅ Done | not yet committed |
-| P8 Crash recovery | ⬜ Not started | |
+| P7 Idempotency, drift and retries | ✅ Done | `206bdf6` (PR #7, merged as `1661258`) |
+| P8 Crash recovery | ✅ Done | not yet committed |
 | P9 CLI completeness and demo | ⬜ Not started | |
 | P10 CI complete | ⬜ Not started | |
 | P11 Documentation pass | ⬜ Not started | |
@@ -517,31 +517,58 @@ true after P6: exit 2, a `FAIL` VERIFY record, and `current` unchanged.
 
 ## P8: Crash recovery
 
+**Status:** ✅ Done
+
 **Goal:** a run that dies at any stage boundary leaves a state the next run resolves.
 
 **Deliverables**
-- `RECOVER`: runs when `in_flight` is present and the Lease was acquired. It rolls back to
-  `in_flight.previous`, or to `EMPTY`, verifies, sets the Release phase `Interrupted`, then continues
-  with the requested deploy.
-- `deploysim recover --app --env`.
-- `--inject-fault` gains `crash-after-prepare`, `crash-after-deploy` and `crash-during-rollback`.
-  Each calls `os._exit(70)` without releasing the Lease. The README is updated in the same commit.
-- `--lease-seconds`.
+- The controller is restructured:
+  - `Invocation` is the base for one CLI command: it maps environment problems to exit 5,
+    takes the Lease, and always releases it;
+  - `Deploy` and `Recover` extend it;
+  - `Operator` holds the environment, app, state and Lease, plus the helpers deploy and recover
+    share (`_reapply`, `_remove`, `_await_rollout`, `_mark_release`, `_finish`, `recover`);
+  - `Session` extends `Operator` with the deploy stages.
+
+  The P5–P7 e2e suite passed unchanged on the refactor.
+- `Operator.recover()` (`RECOVER` stage) runs right after `load_state` when an intent record
+  exists (the Lease was acquired, so its run is dead):
+  - records `find_intent`;
+  - re-applies `in_flight.previous` and verifies it, or, with no previous, removes the target's
+    stored objects (`EMPTY`);
+  - clears `in_flight`, records `last_outcome` `INTERRUPTED`, and sets the interrupted Release's
+    phase to `Interrupted`. If the Release was never created, that is recorded as `MISSING`;
+  - restore check passes: the requested deploy continues as the next attempt. It fails:
+    `DEGRADED`, `ROLLBACK_FAILED` (exit 3), and the deploy stops.
+- `deploysim recover --app --env [--lease-seconds]`:
+  - `RECOVERED` (exit 0, new `Outcome`);
+  - `NO_OP` with nothing to recover;
+  - `LOCKED` while the Lease is live;
+  - `ROLLBACK_FAILED` if the restore fails.
+- `--inject-fault crash-after-prepare | crash-after-deploy | crash-during-rollback`.
+  `Session.crash_point()` records `inject_crash`, then calls `os._exit(70)`
+  (`ExitCode.SIMULATED_CRASH`) without releasing the Lease or printing a summary.
+  `crash-during-rollback` also makes the target unhealthy, so the rollback happens.
+- The summary gains a `recovery` block (`performed`, `interrupted`, `to`, `result`).
+- `--lease-seconds` was already available on `deploy`, and is now on `recover` too.
 
 **Definition of done**
-- [ ] For every crash point, a run after Lease expiry ends with `in_flight is None` and a named `status`.
-- [ ] All P8 tests pass.
+- [x] For every crash point, a run after Lease expiry ends with `in_flight is None` and status
+      `HEALTHY` (crash points × `test_deploy_recovers`).
+- [x] All P8 tests pass (89 unit, 60 e2e; three consecutive green `make test` runs; e2e about
+      2 min 50 s).
 
 **Tests that must pass** (`tests/e2e/test_recovery.py`)
 
-| Test | Asserts |
-|---|---|
-| `test_crash_leaves_intent[*]` | Parametrised over the 3 crash points: exit 70; `status` `DEPLOYING`; `in_flight` names the target and previous release |
-| `test_locked_while_lease_live` | A deploy immediately after the crash gives exit 4 |
-| `test_deploy_recovers[*]` | After `--lease-seconds 3` expires, deploy gives recovery records in the audit log, then exit 0 with attempt 2 |
-| `test_recover_command` | `recover` restores last known-good; Release `Interrupted`; `status` `HEALTHY` |
-| `test_recover_first_deploy` | A crash on the first deploy, then `recover`, gives `EMPTY` with no workload objects |
-| `test_recover_noop` | `recover` with no `in_flight` gives exit 0 and changes nothing |
+| Test | Asserts | Status |
+|---|---|---|
+| `test_crash_leaves_intent[after-prepare, after-deploy, during-rollback]` | Exit 70, no summary, `inject_crash` on stderr; `DEPLOYING`; `in_flight` names target 1.1.0, previous 1.0.0, and the stage (`PREPARE`, `DEPLOY`, `ROLLBACK`) | ✅ |
+| `test_locked_while_lease_live[*]` | A deploy straight after the crash gives exit 4, `LOCKED` | ✅ |
+| `test_deploy_recovers[*]` | After `--lease-seconds 3` expires: exit 0, `SUCCEEDED`, attempt 2; `recovery` names the interrupted ID, `to` 1.0.0, `SUCCEEDED`; `HEALTHY` on 1.1.0, no `in_flight`; RECOVER records start with `find_intent` and mark `Interrupted`; audit chain intact | ✅ |
+| `test_recover_command` | `recover` while the Lease is live gives exit 4; after expiry, `RECOVERED` to 1.0.0, `HEALTHY`, `last_outcome` `INTERRUPTED`, Release 1.1.0 `Interrupted`, pods back on 1.0.0 | ✅ |
+| `test_recover_first_deploy` | A crash after the first DEPLOY, then `recover`: `EMPTY`, no Deployment or Service, Release `Interrupted` | ✅ |
+| `test_recover_noop` | `recover` with no `in_flight`: exit 0, `NO_OP`, `recovery.performed` false; state ConfigMap resourceVersion unchanged | ✅ |
+| `tests/unit/test_controller.py::test_crash_faults` | `crash-during-rollback` makes the target unhealthy; other crash points do not; `SIMULATED_CRASH` is 70 | ✅ |
 
 ---
 
