@@ -1,7 +1,7 @@
 # Implementation plan
 
-Builds deploysim as specified in [README.md](../README.md). Each phase lands as one commit on `main`,
-with `make lint test` green.
+Builds deploysim as specified in [README.md](../README.md). Each phase lands on `main` as one pull
+request (P0 as a direct commit), with `make lint test` green and CI passing.
 
 ## Pinned inputs
 
@@ -37,7 +37,7 @@ These are checked again at the end of each phase. They have been met for every p
 | P8 Crash recovery | ✅ Done | `fb15d64` (PR #8, merged as `296a390`) |
 | P9 CLI completeness and demo | ✅ Done | `4076f2f` (PR #9, merged as `38034e6`) |
 | P10 CI complete | ✅ Done | `15f45aa`, `6cc599c`, `d49c3ad` (PR #10, merged as `9389d72`) |
-| P11 Documentation pass | ✅ Done | not yet committed |
+| P11 Documentation pass | ✅ Done | `9cb75e1` (PR #11, merged as `8905dbf`) |
 
 ## Phase overview
 

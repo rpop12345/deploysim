@@ -9,13 +9,14 @@ import json
 import os
 import sys
 import time
+import traceback
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
-from deploysim.audit import AuditLog, Entry
+from deploysim.audit import AuditError, AuditLog, Entry
 from deploysim.bundle import Bundle, Violation, canonical_json, version_key
 from deploysim.clock import iso_millis, utcnow
 from deploysim.errors import EnvironmentProblem
@@ -69,6 +70,13 @@ def stored_bundle_name(app: str, version: str) -> str:
 
 def bundle_configmap_name(bundle: Bundle) -> str:
     return stored_bundle_name(bundle.app, bundle.version)
+
+
+def unrestorable(app: str, ref: ReleaseRef) -> str:
+    return (
+        f"cannot restore {ref.release}: ConfigMap {stored_bundle_name(app, ref.version)} is "
+        f"missing; redeploy {ref.release}, or a fixed version, with --allow-degraded"
+    )
 
 
 def release_manifest(bundle: Bundle) -> Manifest:
@@ -304,7 +312,8 @@ class LeaseKeeper:
 
 
 class Invocation:
-    """One CLI command: maps environment problems to exit 5 and always releases the Lease."""
+    """One CLI command: maps environment problems and unexpected errors to exit 5, and always
+    releases the Lease. An intent record left behind is resolved by the next run."""
 
     def __init__(self, controller: Controller, environment: str) -> None:
         self.ctl = controller
@@ -318,8 +327,16 @@ class Invocation:
             cmd = exc.cmd if isinstance(exc, KubeError) else None
             self.run.record(self.run.stage, "error", "ERROR", cmd=cmd, detail={"error": str(exc)})
             ending = Ending(Outcome.ENVIRONMENT_ERROR, error=str(exc))
-        if self.keeper:
-            self.keeper.release(self.run)
+        except AuditError:
+            raise
+        except Exception as exc:
+            error = f"unexpected {type(exc).__name__}: {exc}"
+            traceback.print_exc(file=self.run.progress)
+            self.run.record(self.run.stage, "error", "ERROR", detail={"error": error})
+            ending = Ending(Outcome.ENVIRONMENT_ERROR, error=error)
+        finally:
+            if self.keeper:
+                self.keeper.release(self.run)
         return DeployReport(ending.outcome, self.run.summary(ending, self.ctl.clock()))
 
     def _execute(self) -> Ending:
@@ -505,23 +522,28 @@ class Operator:
         self.run.record(stage, "rollout_status", result, cmd=verification.cmd, detail=detail)
         return verification
 
-    def _stored_objects(self, stage: str, ref: ReleaseRef) -> list[Manifest]:
-        """The objects stored for ref, or [] if PREPARE never stored them."""
+    def _stored_objects(self, stage: str, ref: ReleaseRef) -> list[Manifest] | None:
+        """The objects stored for ref, or None if its bundle ConfigMap does not exist."""
         name = stored_bundle_name(self.app, ref.version)
         try:
             stored = self.env.get("configmap", name)
         except NotFound as exc:
             missing: Detail = {"configmap": name}
             self.run.record(stage, "load_bundle", "MISSING", cmd=exc.cmd, detail=missing)
-            return []
+            return None
         objects: list[Manifest] = json.loads(stored.json()["data"][BUNDLE_KEY])
         detail = {"configmap": name, "objects": len(objects)}
         self.run.record(stage, "load_bundle", "OK", cmd=stored.cmd, detail=detail)
         return objects
 
-    def _reapply(self, stage: str, ref: ReleaseRef, fault: str | None) -> tuple[list[str], int]:
-        """Applies ref's stored objects; returns its Deployments and health check timeout."""
+    def _reapply(
+        self, stage: str, ref: ReleaseRef, replaced: list[Manifest], fault: str | None
+    ) -> tuple[list[str], int] | None:
+        """Applies ref's stored objects, then deletes the objects in replaced that ref lacks.
+        Returns ref's Deployments and health check timeout, or None if ref's bundle is gone."""
         objects = self._stored_objects(stage, ref)
+        if objects is None:
+            return None
         release_spec = self.env.get(RELEASES, ref.release).json()["spec"]
         manifests = workload_manifests(objects, self.app, fault)
         result = self.env.apply(manifests)
@@ -531,6 +553,8 @@ class Operator:
             "injected_fault": fault,
         }
         self.run.record(stage, "apply", "OK", cmd=result.cmd, detail=detail)
+        kept = {describe_object(obj) for obj in objects}
+        self._remove(stage, [obj for obj in replaced if describe_object(obj) not in kept])
         return deployment_names(objects), int(release_spec["healthCheck"]["timeoutSeconds"])
 
     def _remove(self, stage: str, objects: list[Manifest]) -> None:
@@ -563,8 +587,9 @@ class Operator:
 
     def recover(self) -> Ending | None:
         """A leftover intent record means its run died. Restores that record's previous
-        release, or removes the target's objects if there was none, and marks the
-        interrupted Release Interrupted. Returns an Ending only if the restore failed."""
+        release and deletes the target's objects it lacks, or removes the target's objects if
+        there was none, and marks the interrupted Release Interrupted. Returns an Ending only
+        if the restore failed."""
         in_flight = self.stored.state.in_flight
         if in_flight is None:
             return None
@@ -578,17 +603,20 @@ class Operator:
         }
         self.run.record("RECOVER", "find_intent", "FOUND", detail=detail)
 
+        replaced = self._stored_objects("RECOVER", target) or []
+        current, restored = previous, previous.release if previous else "nothing"
         if previous is None:
-            self._remove("RECOVER", self._stored_objects("RECOVER", target))
+            self._remove("RECOVER", replaced)
             ok, status, reason = True, Status.EMPTY, "Complete"
+        elif (reapplied := self._reapply("RECOVER", previous, replaced, None)) is None:
+            ok, status, reason = False, Status.DEGRADED, unrestorable(self.app, previous)
+            current, restored = target, "nothing"
         else:
-            names, timeout = self._reapply("RECOVER", previous, None)
-            check = self._await_rollout("RECOVER", names, timeout)
+            check = self._await_rollout("RECOVER", *reapplied)
             ok, reason = check.ok, check.reason
             status = Status.HEALTHY if ok else Status.DEGRADED
-        self._finish("RECOVER", status, previous, "INTERRUPTED")
+        self._finish("RECOVER", status, current, "INTERRUPTED")
 
-        restored = previous.release if previous else "nothing"
         message = f"interrupted at {in_flight.stage}; restored {restored}"
         try:
             self._mark_release(
@@ -609,7 +637,7 @@ class Operator:
         }
         if ok:
             return None
-        error = f"recovery to {restored} failed: {reason}"
+        error = f"recovery to {detail['previous']} failed: {reason}"
         return Ending(Outcome.ROLLBACK_FAILED, error=error)
 
 
@@ -837,7 +865,8 @@ class Session(Operator):
     # ROLLBACK -------------------------------------------------------------------------------
 
     def rollback(self, failed: Verification) -> Ending:
-        """Restores last_known_good and verifies it; on a first deploy, removes the objects."""
+        """Restores last_known_good, deletes the target's objects it lacks, and verifies it;
+        on a first deploy, removes the objects."""
         in_flight = self.stored.state.in_flight
         if in_flight is None:
             raise RuntimeError("ROLLBACK without an intent record")
@@ -850,9 +879,14 @@ class Session(Operator):
             self._conclude(Status.EMPTY, None, Outcome.ROLLED_BACK, "nothing to restore; removed")
             return Ending(Outcome.ROLLED_BACK, error=f"{reason}; first deployment removed")
 
-        names, timeout = self._reapply("ROLLBACK", previous, self.request.rollback_fault)
+        objects, fault = list(self.bundle.objects), self.request.rollback_fault
+        reapplied = self._reapply("ROLLBACK", previous, objects, fault)
+        if reapplied is None:
+            message = unrestorable(self.app, previous)
+            self._conclude(Status.DEGRADED, in_flight.target, Outcome.ROLLBACK_FAILED, message)
+            return Ending(Outcome.ROLLBACK_FAILED, error=f"{reason}; {message}")
         self.crash_point("during-rollback")
-        restored = self._await_rollout("ROLLBACK", names, timeout)
+        restored = self._await_rollout("ROLLBACK", *reapplied)
         if restored.ok:
             message = f"rolled back to {previous.release}"
             self._conclude(Status.HEALTHY, previous, Outcome.ROLLED_BACK, message)
@@ -864,12 +898,15 @@ class Session(Operator):
     def _conclude(
         self, status: Status, current: ReleaseRef | None, outcome: Outcome, message: str
     ) -> None:
+        """current is what the environment now runs; the rollback's target is last_known_good."""
+        in_flight = self.stored.state.in_flight
+        restoring = in_flight.previous if in_flight else None
         self._finish("ROLLBACK", status, current, outcome)
         phase = "RolledBack" if outcome == Outcome.ROLLED_BACK else "RollbackFailed"
         self._phase("ROLLBACK", phase, message)
         self.run.rollback = {
             "performed": True,
-            "to": current.release if current else None,
+            "to": restoring.release if restoring else None,
             "result": "SUCCEEDED" if outcome == Outcome.ROLLED_BACK else "FAILED",
         }
 

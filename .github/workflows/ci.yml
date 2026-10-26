@@ -150,6 +150,14 @@ jobs:
         env:
           DEPLOYSIM: ${{ runner.temp }}/wheel/bin/deploysim
           AUDIT_LOG: ${{ runner.temp }}/demo-audit.jsonl
+      - name: The wheel runs outside the checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          deploysim() { PATH="$GITHUB_WORKSPACE/bin:$PATH" "$RUNNER_TEMP/wheel/bin/deploysim" "$@"; }
+          bundle="$GITHUB_WORKSPACE/examples/orders-api-1.0.0.yaml"
+          deploysim validate "$bundle" --audit-log outside-audit.jsonl
+          deploysim deploy "$bundle" --env dev --audit-log outside-audit.jsonl \
+            --kubeconfig "$GITHUB_WORKSPACE/.deploysim/kubeconfig"
       - name: Collect diagnostics
         if: failure()
         run: |

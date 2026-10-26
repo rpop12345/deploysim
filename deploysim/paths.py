@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+PACKAGE = Path(__file__).resolve().parent
 
 
 @dataclass(frozen=True)
 class Paths:
-    """root is $DEPLOYSIM_ROOT, or the current directory."""
+    """root is $DEPLOYSIM_ROOT, or the current directory. Outside a checkout, tools come from
+    PATH, and the schemas and CRDs from the installed package."""
 
     root: Path
 
@@ -19,19 +23,19 @@ class Paths:
 
     @property
     def kubectl(self) -> Path:
-        return self.root / "bin" / "kubectl"
+        return self._tool("kubectl")
 
     @property
     def kubectl_validate(self) -> Path:
-        return self.root / "bin" / "kubectl-validate"
+        return self._tool("kubectl-validate")
 
     @property
     def schemas(self) -> Path:
-        return self.root / "schemas"
+        return self._data("schemas")
 
     @property
     def crds(self) -> Path:
-        return self.root / "crds"
+        return self._data("crds")
 
     @property
     def state_dir(self) -> Path:
@@ -44,3 +48,12 @@ class Paths:
     @property
     def kubeconfig(self) -> Path:
         return self.state_dir / "kubeconfig"
+
+    def _tool(self, name: str) -> Path:
+        pinned = self.root / "bin" / name
+        found = None if pinned.exists() else shutil.which(name)
+        return Path(found) if found else pinned
+
+    def _data(self, name: str) -> Path:
+        local, packaged = self.root / name, PACKAGE / name
+        return packaged if not local.exists() and packaged.exists() else local

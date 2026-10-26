@@ -25,17 +25,28 @@ before anything touches the cluster.
 | Tests: success, invalid input, failed health check, repeated execution | [Tests](#tests) |
 | CI build/test/package workflow | [CI](#ci) |
 | Production controls | [Production controls](#production-controls) |
+| Assumptions | [Assumptions](#assumptions) |
+| Time spent, and what another day would add | [Time spent](#time-spent) |
+| AI-assisted development process | [AI_PROCESS.md](AI_PROCESS.md) |
 
 ## Quick start
 
 Requires Python 3.11+ on macOS or Linux, and `jq` for the demo. Docker is not needed: KWOK's binary
 runtime runs the control plane as local processes.
 
+Without a cluster, in about a minute: pinned tools, a virtualenv, and the unit tests.
+
+```sh
+make tools install-dev test-unit
+```
+
+The full run, against a local cluster:
+
 ```sh
 make tools          # pinned kwokctl, kwok, kubectl, kubectl-validate into ./bin, checksums verified
 make cluster-up     # KWOK cluster: fake nodes, dev/staging/prod namespaces, Release CRD, fault stages
 make install-dev    # venv with deploysim, pytest, ruff, mypy
-make test           # unit and end-to-end tests against the cluster, 85% coverage gate (about 3 min)
+make test           # unit and end-to-end tests against the cluster, 85% coverage gate (about 4 min)
 make demo           # 23 scenarios end to end, asserting every exit code (about 80 s)
 make cluster-down
 ```
@@ -276,12 +287,12 @@ semantic-version precedence, so `1.0.0-rc.1` < `1.0.0` < `1.10.0`.
 | Stage | What it does |
 |---|---|
 | `LOCK` | Creates the `Lease` `deploysim-<app>` in the environment namespace. A Lease held by a live run gives `LOCKED`. An expired Lease is taken over with a compare-and-swap write, and the takeover is audited. The Lease is renewed on every rollout poll, in `VERIFY`, `ROLLBACK` and `RECOVER`. |
-| `RECOVER` | Runs when the state still has an `in_flight` record but no live run holds the Lease, which means the previous run died. It re-applies that record's `previous` release and verifies it. If there was no previous release, it deletes the target's stored objects and the environment becomes `EMPTY`. It then clears `in_flight`, records the attempt as `INTERRUPTED`, and sets the target Release's phase to `Interrupted`. If the restored release fails its check, the environment becomes `DEGRADED`, the outcome is `ROLLBACK_FAILED` (exit 3), and the requested deploy does not run. |
+| `RECOVER` | Runs when the state still has an `in_flight` record but no live run holds the Lease, which means the previous run died. It re-applies that record's `previous` release, deletes the target's objects that release does not have, and verifies it. If there was no previous release, it deletes the target's stored objects and the environment becomes `EMPTY`. It then clears `in_flight`, records the attempt as `INTERRUPTED`, and sets the target Release's phase to `Interrupted`. If the restored release fails its check, or its stored bundle ConfigMap is missing, the environment becomes `DEGRADED`, the outcome is `ROLLBACK_FAILED` (exit 3), and the requested deploy does not run. |
 | `PREPARE` | Writes `in_flight` (deployment ID, attempt, target, `previous` = `last_known_good`, stage) to the state ConfigMap. Stores the bundle in an immutable ConfigMap. Applies the `Release` and sets its phase to `Deploying`. All of this happens before the workload changes, so a crash at any later point is recoverable. |
 | `DEPLOY` | `kubectl apply --server-side --field-manager=deploysim --force-conflicts` of the workload objects, each labelled `app.kubernetes.io/managed-by: deploysim`. |
 | `VERIFY` | Polls every Deployment in the bundle every 0.5 s and renews the Lease on each poll. It passes when the rollout is complete, by the same rule `kubectl rollout status` uses: `observedGeneration` is current, no old replicas remain, and the updated and available replica counts equal `replicas`. It fails as soon as the `Progressing` condition reports `ProgressDeadlineExceeded`, or when `healthCheck.timeoutSeconds` elapses. |
 | `COMPLETE` | Sets `current` and `last_known_good` to the target, clears `in_flight`, and sets the Release phase to `Succeeded`. |
-| `ROLLBACK` | Re-applies the `last_known_good` release's bundle from its immutable ConfigMap and verifies it the same way, with that release's own `healthCheck.timeoutSeconds`. If that check passes, the outcome is `ROLLED_BACK` (exit 2) and the Release phase `RolledBack`. If it fails, the outcome is `ROLLBACK_FAILED` (exit 3), the environment is `DEGRADED`, and the phase is `RollbackFailed`. On a first deployment there is nothing to restore: the bundle's objects are deleted and the environment returns to `EMPTY`. |
+| `ROLLBACK` | Re-applies the `last_known_good` release's bundle from its immutable ConfigMap, deletes the objects only the failed release had (by kind and name), and verifies it the same way, with that release's own `healthCheck.timeoutSeconds`. If that check passes, the outcome is `ROLLED_BACK` (exit 2) and the Release phase `RolledBack`. If it fails, the outcome is `ROLLBACK_FAILED` (exit 3), the environment is `DEGRADED`, and the phase is `RollbackFailed`. If the known-good bundle ConfigMap is missing, nothing is restored: the outcome is `ROLLBACK_FAILED`, `current` stays the failed release, and the error names the ConfigMap. On a first deployment there is nothing to restore: the bundle's objects are deleted and the environment returns to `EMPTY`. |
 
 Rollback re-applies the known-good bundle rather than running `kubectl rollout undo`. `rollout undo`
 only reverts the pod template, never the Services and ConfigMaps alongside it. It also depends on
@@ -397,7 +408,9 @@ These options apply to every command:
 - `--audit-log` (default `.deploysim/audit.jsonl`)
 
 Relative defaults, along with `bin/`, `schemas/` and `crds/`, resolve from the project root. The
-project root is the current directory, or `$DEPLOYSIM_ROOT` when set.
+project root is the current directory, or `$DEPLOYSIM_ROOT` when set. Outside a checkout, the
+installed wheel uses its packaged copies of `schemas/` and `crds/`, and `kubectl` and
+`kubectl-validate` from `PATH`; pass `--kubeconfig` to reach the simulator.
 
 What each command does:
 - `validate` runs pass 1 only. It needs no cluster.
@@ -539,7 +552,7 @@ The walkthrough's `DEPLOY apply` record for that run, formatted here (one line i
 | 2 | `ROLLED_BACK`: health check failed, previous release restored and healthy |
 | 3 | `ROLLBACK_FAILED`: environment `DEGRADED`, operator action needed |
 | 4 | `LOCKED`: another live run holds the Lease |
-| 5 | `ENVIRONMENT_ERROR`: missing tool, unreachable cluster, unwritable audit log, safety guard refused, or the Lease was taken over. If it happens mid-deployment, the next run recovers. |
+| 5 | `ENVIRONMENT_ERROR`: missing tool, unreachable cluster, a kubectl or kubectl-validate timeout, unwritable audit log, safety guard refused, the Lease was taken over, or an unexpected internal error (with a traceback on stderr). `deploy` and `recover` still print their summary and release the Lease. If it happens mid-deployment, the next run recovers. |
 | 64 | Usage error (`EX_USAGE`, so it never collides with 2) |
 | 70 | Simulated crash (`--inject-fault crash-*`). Nothing is cleaned up; the next run recovers. |
 
@@ -559,12 +572,14 @@ out". Re-running a command is always safe.
 | Environment is `DEGRADED` | `REJECTED` unless `--allow-degraded`, so fixing forward is a deliberate human decision |
 
 Recovery rolls back to the intent record's `previous` release and verifies it, whatever stage the dead
-run had reached. If the restored release fails its health check, the environment becomes `DEGRADED`
-and the requested deployment does not run.
+run had reached. If the restored release fails its health check, or its stored bundle ConfigMap has
+been deleted, the environment becomes `DEGRADED` and the requested deployment does not run. To get
+out of `DEGRADED`, redeploy that version, or a fixed one, with `--allow-degraded`.
 
 At no point can the environment be in a state deploysim cannot name. The intent record is written
 before the workload changes. Every state write is a compare-and-swap. Every non-terminal state has one
-defined recovery path.
+defined recovery path. Any error, expected or not, ends with exit 5 and never with exit 1, which
+always means "rejected, nothing changed".
 
 A crashed run holds its Lease until it expires (`--lease-seconds`, default 30), so the next run reports
 `LOCKED` until then. That is the price of telling a dead run from a slow one without asking it.
@@ -618,22 +633,23 @@ the failure cases take seconds.
 |---|---|---|
 | `tests/unit/test_smoke.py` | `deploysim --version` and `python -m deploysim --version` | — |
 | `tests/unit/test_install_tool.py` | A tool is installed and recorded; a second run downloads nothing; a wrong checksum leaves no binary; tar members are extracted; a platform with no pinned checksum fails | — |
-| `tests/unit/test_validate.py` | Every example passes; each of the 23 fixtures in `tests/fixtures/invalid/` produces exactly the violations its header names; kubectl-validate never runs a hostile kubeconfig's credential plugin (with a control showing it would, unisolated); the bundle digest ignores order and formatting; `validate` exit codes, JSON and audit record | Invalid input |
+| `tests/unit/test_validate.py` | Every example passes; each of the 23 fixtures in `tests/fixtures/invalid/` produces exactly the violations its header names; kubectl-validate never runs a hostile kubeconfig's credential plugin (with a control showing it would, unisolated); the bundle digest ignores order and formatting; a kubectl-validate timeout is an environment error; `validate` exit codes, JSON and audit record | Invalid input |
 | `tests/unit/test_bundle.py` | Semantic-version precedence, using the specification's own ordering example | Repeated execution |
 | `tests/unit/test_audit.py` | `seq` is gap-free; the hash chain verifies; edited, deleted, reordered and truncated lines are detected; 8 concurrent writers produce one valid chain; every append is fsynced; an unwritable log raises `AuditError`; record fields match this README | Audit-friendly result |
-| `tests/unit/test_kube.py` | The safety guard refuses a remote server, a missing kubeconfig, or an unknown context, before any process runs; every call pins `--kubeconfig` and `$KUBECONFIG`; recorded kubectl errors are classified correctly; only `kube.py` and `validate.py` start processes | Never touch a real environment |
-| `tests/unit/test_health.py` | Rollout decision for every state (unobserved, updating, terminating, unavailable, complete, deadline exceeded); the VERIFY loop waits, renews on every poll, fails fast on the deadline, and times out | Simulated health check |
-| `tests/unit/test_controller.py` | Deployment ID is stable, ignores defaulted fields, and changes with environment or bundle; in-cluster manifests carry labels and the bundle digest; fault injection touches only pod templates; outcome-to-exit-code mapping | Audit-friendly result |
-| `tests/unit/test_cli.py` | Usage errors exit 64; the deploy summary has exactly this README's keys, in order and with matching types; `history` filters and `history --verify` (exit 1 on a tampered log); `deploy` and `status` refuse a non-loopback kubeconfig with exit 5; an unwritable audit log exits 5 without a traceback | Audit-friendly result, never touch a real environment |
+| `tests/unit/test_kube.py` | The safety guard refuses a remote server, a missing kubeconfig, or an unknown context, before any process runs; every call pins `--kubeconfig` and `$KUBECONFIG`; recorded kubectl errors are classified correctly; a kubectl timeout is `Unreachable`; only `kube.py` and `validate.py` start processes | Never touch a real environment |
+| `tests/unit/test_health.py` | Rollout decision for every state (unobserved, updating, terminating, unavailable, complete, deadline exceeded); the VERIFY loop waits, renews on every poll, fails fast on the deadline, and times out; an empty Deployment list never counts as complete | Simulated health check |
+| `tests/unit/test_controller.py` | Deployment ID is stable, ignores defaulted fields, and changes with environment or bundle; in-cluster manifests carry labels and the bundle digest; fault injection touches only pod templates; outcome-to-exit-code mapping; an unexpected error exits 5 with a summary and releases the Lease | Audit-friendly result, never ambiguous |
+| `tests/unit/test_cli.py` | Usage errors exit 64; the deploy summary has exactly this README's keys, in order and with matching types; `history` filters and `history --verify` (exit 1 on a tampered log); `deploy` and `status` refuse a non-loopback kubeconfig with exit 5; a kubectl timeout during `deploy` exits 5 with a summary and an audit record; an unwritable audit log exits 5 without a traceback | Audit-friendly result, never touch a real environment |
+| `tests/unit/test_paths.py` | A checkout's `bin/`, `schemas/` and `crds/` are preferred; outside one, tools come from `PATH` and schemas and CRDs from the installed package | Runnable artifact |
 | `tests/unit/test_readme.py` | This README's exit-code table equals `ExitCode`; every outcome, command and `--inject-fault` value is documented | — |
 | `tests/unit/test_repo.py` | Every CI action is pinned to a commit SHA; PyYAML is the only runtime dependency; every tool has a pinned SHA-256 for all four platforms; no script reads `~/.kube` or calls kwokctl or kubectl without `--kubeconfig` | Never touch a real environment |
 | `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; the API server enforces the Release name rule, Release spec immutability and the immutable bundle ConfigMap; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster. `cluster-up` on its own throwaway cluster: creates, re-runs without changes, recreates a stopped cluster, refuses another fingerprint, and leaves `~/.kube/config` unchanged. | The simulated environment |
 | `tests/e2e/test_kube.py` | An unlabelled or missing namespace is refused; a Lease is exclusive, renewable, released and taken over after expiry; a stale holder's renew and release fail with `Conflict`; state round-trips and a stale save fails with `Conflict`; drift sees real changes and never controller updates (20 fresh Deployments) | Safe to retry, never ambiguous |
 | `tests/e2e/test_deploy.py` | First deployment (Release, state, bundle ConfigMap, Lease released, labels); upgrade replaces every pod; promotion dev → staging → prod; `slow-start` succeeds after waiting; audit trail in stage order with commands; a failed health check exits 2 and leaves `current` untouched; `status` reports state, Releases and rollout | Successful deployment, failed health check |
 | `tests/e2e/test_rejections.py` | An invalid bundle creates nothing; the promotion gate rejects a release new to staging and a changed bundle; reusing a version with a different image or manifests is rejected; a held Lease gives exit 4 and changes nothing; a `DEGRADED` environment needs `--allow-degraded` | Invalid input, repeated execution |
-| `tests/e2e/test_rollback.py` | `--inject-fault unhealthy` upgrade rolls back to the previous release, and its pods keep serving: ready old pods never drop below `replicas - maxUnavailable`, sampled throughout; the stored bundle stays unannotated; a broken build (fault in the bundle) rolls back; an unhealthy first deployment removes its objects and returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3; a `DEGRADED` environment needs `--allow-degraded`. After every scenario there is no `in_flight` record. | Failed health check, rollback |
+| `tests/e2e/test_rollback.py` | `--inject-fault unhealthy` upgrade rolls back to the previous release, and its pods keep serving: ready old pods never drop below `replicas - maxUnavailable`, sampled throughout; the stored bundle stays unannotated; a broken build (fault in the bundle) rolls back; an unhealthy first deployment removes its objects and returns to `EMPTY`; rollback deletes a Deployment only the failed release added; `unhealthy-rollback` ends `DEGRADED` with exit 3; a deleted known-good bundle ConfigMap ends `ROLLBACK_FAILED` and `DEGRADED`, and redeploying that version with `--allow-degraded` recovers; a `DEGRADED` environment needs `--allow-degraded`. After every scenario there is no `in_flight` record. | Failed health check, rollback |
 | `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`, with no write step and the state, Release, Deployment generation and ReplicaSets unchanged; a manual `kubectl scale` is detected and corrected; retry after rollback is attempt 2 with the same deployment ID; two concurrent deploys give exactly one exit 0 and one exit 4, with consistent state; a downgrade is flagged; a 2 s Lease stays held through a slower VERIFY, because every poll renews it | Repeated execution |
-| `tests/e2e/test_recovery.py` | For each crash point (`after-prepare`, `after-deploy`, `during-rollback`): exit 70 leaves `DEPLOYING` and an intent record naming the stage; a deploy while the Lease is live is `LOCKED`; after expiry, the deploy recovers (records the interrupted ID, restores 1.0.0) and then succeeds as attempt 2. `recover`: `LOCKED` while the Lease is live, then `RECOVERED` to the previous release with the Release `Interrupted`; a crashed first deploy recovers to `EMPTY`; with nothing to recover it is a `NO_OP` that writes nothing. | Never ambiguous |
+| `tests/e2e/test_recovery.py` | For each crash point (`after-prepare`, `after-deploy`, `during-rollback`): exit 70 leaves `DEPLOYING` and an intent record naming the stage; a deploy while the Lease is live is `LOCKED`; after expiry, the deploy recovers (records the interrupted ID, restores 1.0.0) and then succeeds as attempt 2. `recover`: `LOCKED` while the Lease is live, then `RECOVERED` to the previous release with the Release `Interrupted`; a crashed first deploy recovers to `EMPTY`; recovery deletes objects only the interrupted release added; a deleted known-good bundle ConfigMap ends `ROLLBACK_FAILED` and `DEGRADED`, and the next `recover` is a `NO_OP`; with nothing to recover it is a `NO_OP` that writes nothing. | Never ambiguous |
 
 Behaviour the tests cannot reach on their own is shown by `make demo`, and by CI's `e2e` job, which
 runs the tests and the demo against the built wheel.
@@ -644,7 +660,7 @@ runs the tests and the demo against the built wheel.
 deploysim/
   __main__.py      CLI entry point (python -m deploysim)
   cli.py           argument parsing, exit codes, output
-  paths.py         project root and the tool, schema and state paths under it
+  paths.py         tool, schema and state paths: the checkout, else PATH and packaged copies
   bundle.py        loading release bundles, structure checks, bundle policy, bundle digest
   validate.py      pass 1: kubectl-validate offline, then bundle policy
   errors.py        problems that mean exit code 5: missing tools, unsafe targets
@@ -686,7 +702,7 @@ package ───┴──► e2e (KWOK)
 | `unit` | `make tools`, then `pytest tests/unit` on Python 3.11 and 3.14 |
 | `manifests` | `kubectl-validate crds/`, then `deploysim validate` on every file in `examples/`; every bundle must pass |
 | `package` | `make package`: wheel, sdist, CycloneDX SBOM of the installed wheel, `SHA256SUMS`. On pushes to `main`, a build provenance attestation of the wheel and sdist. Uploaded as the `dist` artifact. |
-| `e2e` | Installs the `dist` wheel into a clean venv and moves the checkout's `deploysim/` aside, so every import, including the CLI that the tests and demo start, is the wheel. Then `make cluster-up`, `make schemas` followed by `git diff --exit-code schemas/`, `pytest -m e2e tests/e2e`, and `scripts/demo.sh`. On failure it uploads `e2e-diagnostics`: `kwokctl logs` for each component, `kubectl get events -A`, the objects as YAML, and every audit log the tests and demo wrote. The cluster is always deleted at the end. |
+| `e2e` | Installs the `dist` wheel into a clean venv and moves the checkout's `deploysim/` aside, so every import, including the CLI that the tests and demo start, is the wheel. Then `make cluster-up`, `make schemas` followed by `git diff --exit-code schemas/`, `pytest -m e2e tests/e2e`, and `scripts/demo.sh`. Last, from outside the checkout, the wheel validates and deploys an example with its packaged schemas and CRD and the tools on `PATH`. On failure it uploads `e2e-diagnostics`: `kwokctl logs` for each component, `kubectl get events -A`, the objects as YAML, and every audit log the tests and demo wrote. The cluster is always deleted at the end. |
 
 Three details are deliberate:
 - **The e2e job tests the wheel, not the checkout.** A packaging mistake, such as a module left out
@@ -783,13 +799,33 @@ one names where it would plug into deploysim.
 - Retention meets the organisation's compliance requirements.
 - Hook: the audit writer gains a remote sink; the local hash chain still detects gaps in transit.
 
+## Assumptions
+
+- **One app per bundle, one local cluster.** `dev`, `staging` and `prod` are namespaces in one KWOK
+  cluster, standing in for separate clusters.
+- **Ready means healthy.** The health check is the rollout: every replica updated and Ready before
+  the progress deadline. Error rates and latency are out of scope; see
+  [Observability gates](#observability-gates) for where they plug in.
+- **Images are built elsewhere.** A bundle references its image by digest; deploysim never builds
+  or pulls it.
+- **Promotion is strictly `dev → staging → prod`.** No environment can be skipped.
+- **Runners' clocks agree.** Lease expiry compares the holder's `renewTime` with the local clock, so
+  skew must stay well under `--lease-seconds`. Compare-and-swap still stops a stale run's state
+  writes.
+- **Tools are installed separately.** The wheel carries the validation schemas and the Release
+  CRD, but not `kubectl` or `kubectl-validate`: it uses the pinned copies in `bin/` when run from a
+  checkout, and otherwise whatever is on `PATH`.
+- **One operator's machine.** The audit log is a local file; shipping it off-host is a
+  [production control](#audit-and-compliance).
+
 ## Limitations
 
 - **Nothing runs in the pods.** Readiness comes from KWOK Stages, not from probes. VERIFY proves the
   rollout mechanics, not the application's behaviour.
 - **Namespaces stand in for environments.** Production environments would be separate clusters, and
   usually separate cloud accounts.
-- **No pruning.** An object removed from a bundle is left in place by the next deploy.
+- **No pruning on forward deploys.** An object removed from a bundle is left in place by the next
+  deploy. Rollback and recovery do delete the objects only the failed release had.
 - **Control-plane binaries are not checksum-pinned here.** kwokctl downloads kube-apiserver,
   kube-controller-manager, kube-scheduler and etcd for the pinned Kubernetes version into
   `~/.kwok/cache` itself. Only the kwok controller comes from the verified `bin/kwok`.
@@ -800,3 +836,19 @@ one names where it would plug into deploysim.
   compare-and-swap, it stops with exit 5, and the next run recovers.
 - **Local audit log.** The hash chain makes tampering detectable, not impossible. Anyone who can
   rewrite the whole file can rebuild the chain; shipping records off-host closes that gap.
+
+## Time spent
+
+About 6 hours over 4 days, against the suggested 2. The 2-hour core is validate → apply → verify →
+roll back, in `deploysim/controller.py`. The rest went into testing against a real API server rather
+than mocks, and into crash recovery and retry safety.
+
+### With another day
+
+- **Unit-test the controller against an in-memory `Environment`.** Rollback, retry and recovery are
+  covered end to end on KWOK, but not without a cluster.
+- **Classify kubectl errors by API status,** not by matching stderr text, which can change with a
+  kubectl upgrade.
+- **Renew the Lease throughout a run,** from a background thread, not only while polling a rollout.
+- **Move `--inject-fault` out of the shipped CLI,** behind a test-only entry point, since the crash
+  faults call `os._exit`.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -131,6 +132,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return status_command(args.app, args.env, paths, args.kubeconfig)
     except AuditError as exc:
         print(f"deploysim: audit log: {exc}", file=sys.stderr)
+        return ExitCode.ENVIRONMENT_ERROR
+    except Exception:
+        print("deploysim: unexpected error", file=sys.stderr)
+        traceback.print_exc()
         return ExitCode.ENVIRONMENT_ERROR
 
 

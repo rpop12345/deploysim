@@ -19,6 +19,7 @@ from deploysim.paths import Paths
 SIMULATOR_LABEL = "deploysim.io/simulator"
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 FIELD_MANAGER = "deploysim"
+KUBECTL_TIMEOUT_SECONDS = 120
 
 Manifest = dict[str, Any]
 
@@ -151,7 +152,7 @@ class Kubectl:
 
     def __init__(self, binary: Path, kubeconfig: Path) -> None:
         if not binary.exists():
-            raise ToolError(f"{binary} not found; run make tools")
+            raise ToolError(f"{binary} not found; run make tools, or put kubectl on PATH")
         self.server = check_loopback(kubeconfig)
         self.binary = binary
         self.kubeconfig = kubeconfig
@@ -164,15 +165,18 @@ class Kubectl:
         """stdin is sent as JSON. Raises a classified KubeError on a non-zero exit."""
         cmd = (str(self.binary), "--kubeconfig", str(self.kubeconfig), *args)
         env = {**os.environ, "KUBECONFIG": str(self.kubeconfig)}
-        completed = subprocess.run(
-            cmd,
-            input=None if stdin is None else json.dumps(stdin),
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-            timeout=120,
-        )
+        try:
+            completed = subprocess.run(
+                cmd,
+                input=None if stdin is None else json.dumps(stdin),
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+                timeout=KUBECTL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise Unreachable(cmd, f"kubectl timed out after {KUBECTL_TIMEOUT_SECONDS} s") from exc
         if completed.returncode != 0:
             raise classify(cmd, completed.stderr)
         return Result(cmd, completed.stdout)
