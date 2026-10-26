@@ -39,7 +39,7 @@ class InFlight:
 
 
 @dataclass(frozen=True)
-class Outcome:
+class LastOutcome:
     deployment_id: str
     attempt: int
     outcome: str
@@ -55,7 +55,7 @@ class State:
     current: ReleaseRef | None = None
     last_known_good: ReleaseRef | None = None
     in_flight: InFlight | None = None
-    last_outcome: Outcome | None = None
+    last_outcome: LastOutcome | None = None
     attempts: dict[str, int] = field(default_factory=dict)
     updated_at: str | None = None
 
@@ -81,7 +81,7 @@ class State:
                 stage=in_flight["stage"],
                 started_at=in_flight["started_at"],
             ),
-            last_outcome=Outcome(**data["last_outcome"]) if data.get("last_outcome") else None,
+            last_outcome=LastOutcome(**data["last_outcome"]) if data.get("last_outcome") else None,
             attempts=dict(data.get("attempts") or {}),
             updated_at=data.get("updated_at"),
         )
@@ -113,8 +113,8 @@ class StateStore:
         """An empty state when the ConfigMap does not exist yet."""
         try:
             result = self.env.get("configmap", state_name(self.app))
-        except NotFound:
-            return Stored(State(self.app, self.env.name), None, None)
+        except NotFound as exc:
+            return Stored(State(self.app, self.env.name), None, exc.cmd)
         configmap = result.json()
         state = State.from_dict(json.loads(configmap["data"][STATE_KEY]))
         return Stored(state, configmap["metadata"]["resourceVersion"], result.cmd)

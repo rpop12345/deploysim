@@ -11,7 +11,7 @@ from deploysim.errors import UnsafeTarget
 from deploysim.kube import Conflict, Environment, Invalid, Kubectl
 from deploysim.lease import Locked, acquire, release, renew
 from deploysim.paths import Paths
-from deploysim.state import InFlight, Outcome, ReleaseRef, State, StateStore, Status
+from deploysim.state import InFlight, LastOutcome, ReleaseRef, State, StateStore, Status
 from tests.e2e import support
 from tests.e2e.support import REPO, deployment, image
 
@@ -112,7 +112,7 @@ def full_state(app: str) -> State:
         current=good,
         last_known_good=good,
         in_flight=InFlight("dep-b", 2, target, good, "VERIFY", "2026-10-24T10:00:00.000Z"),
-        last_outcome=Outcome("dep-b", 1, "ROLLED_BACK"),
+        last_outcome=LastOutcome("dep-b", 1, "ROLLED_BACK"),
         attempts={"dep-a": 1, "dep-b": 2},
     )
 

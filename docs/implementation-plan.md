@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P4.
+These are checked again at the end of each phase. They have been met for P0 to P5.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -30,8 +30,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P1 Simulated environment | ✅ Done | `d010efa` (PR #1, merged as `4e81ac6`) |
 | P2 Audit log | ✅ Done | `a01f40f` (PR #2, merged as `712c753`) |
 | P3 Bundle loading and offline validation | ✅ Done | `829f0d2` (PR #3, merged as `6b23ac2`) |
-| P4 Kubernetes access layer | ✅ Done | not yet committed |
-| P5 Deploy, happy path | ⬜ Not started | |
+| P4 Kubernetes access layer | ✅ Done | `5794c9c` (PR #4, merged as `87f48ea`) |
+| P5 Deploy, happy path | ✅ Done | not yet committed |
 | P6 Rollback and degraded environments | ⬜ Not started | |
 | P7 Idempotency, drift and retries | ⬜ Not started | |
 | P8 Crash recovery | ⬜ Not started | |
@@ -347,50 +347,82 @@ compare-and-swap state.
 
 ## P5: Deploy, happy path
 
+**Status:** ✅ Done
+
 **Goal:** `deploysim deploy` takes a valid release to `SUCCEEDED` and rejects everything pass 2
 should reject.
 
 **Deliverables**
-- `deploysim/controller.py`, implementing these stages:
+- `deploysim/controller.py`:
+  - `Controller.deploy(DeployRequest)` returns a `DeployReport` (outcome and summary). `Deploy`
+    runs the stages up to holding the Lease. `Session` runs the stages that need the Lease, with
+    the environment, bundle, state and `LeaseKeeper` always present;
   - pass-1 validation, then `LOCK`;
-  - pass-2 validation: environment, promotion gate, degraded gate, immutability, server dry run;
-  - `PREPARE`: write `in_flight`, create the immutable bundle ConfigMap, apply the Release with
-    phase `Deploying`;
-  - `DEPLOY`, `VERIFY`, `COMPLETE`, then release the Lease.
-- `deploysim/health.py`:
-  - polls each Deployment and renews the Lease on every poll;
-  - passes when the rollout is complete;
-  - fails on `ProgressDeadlineExceeded` or when the timeout elapses.
-- `deployment_id` derivation, attempt counting, the summary JSON on stdout, progress lines on stderr,
-  and exit codes 0, 1, 4 and 5.
-- `deploysim status`.
-- Every object deploysim creates carries the labels `app.kubernetes.io/name` and
+  - pass 2: degraded gate (`environment:DEGRADED`), promotion gate (`promotion:GATE`: the same
+    Release spec and bundle digest `Succeeded` one environment earlier), immutability
+    (`immutability:RELEASE_SPEC`, `immutability:BUNDLE`), then a server dry run
+    (`server:DRY_RUN`) of the Release, the bundle ConfigMap and the workload objects;
+  - `PREPARE`: write `in_flight`, create the immutable bundle ConfigMap
+    `deploysim-<app>-<version>` (`objects.json`, digest annotation), apply the Release (digest
+    annotation), set phase `Deploying`;
+  - `DEPLOY`: apply the workload objects, then record `in_flight.stage = DEPLOY`;
+  - `VERIFY`: phase `Verifying`, then `health.verify`, renewing the Lease on every poll
+    (`LeaseLost` on `Conflict`);
+  - `COMPLETE`: `current` and `last_known_good` set to the target, `in_flight` cleared, status
+    `HEALTHY`, phase `Succeeded`;
+  - the Lease is released at the end of every run, whatever the outcome.
+- `deploysim/health.py`: `rollout_status` uses `kubectl rollout status`'s decision, and also
+  fails on `ProgressDeadlineExceeded`. `verify` polls every Deployment, calls `on_poll` after each
+  poll, and returns `Complete`, `ProgressDeadlineExceeded` or `Timeout`.
+- `deploysim/outcomes.py`: `ExitCode`, moved from `cli.py`, and `Outcome` with its exit code.
+  `VERIFY_FAILED` maps to 2 until P6 replaces it with `ROLLED_BACK`.
+- `deployment_id` = `dep-` plus 12 hex of sha256(app | environment | defaulted Release spec |
+  bundle digest). The attempt is the next number for that ID in `state.attempts`. The summary JSON
+  goes to stdout, with one progress line per audit record on stderr. Exit codes 0, 1, 2
+  (`VERIFY_FAILED`), 4 and 5.
+- `deploysim status --app --env`: state, Releases with their phase, and the live rollout as JSON.
+- Every object deploysim creates carries `app.kubernetes.io/name` and
   `app.kubernetes.io/managed-by: deploysim`.
+- `Bundle.spec`: the Release spec with CRD defaults, so a Release without `healthCheck` compares
+  equal to the server's copy.
+- Test support: `write_bundle`, a `deploysim` CLI runner, and the `deploy` and `audit_log`
+  fixtures.
 
-**Out of scope:** a failing `VERIFY` exits 2 and leaves `in_flight` in place. Rollback is P6, and
-P6's tests are marked `xfail` until then.
+**Out of scope:** a failing `VERIFY` exits 2 (`VERIFY_FAILED`), leaves `in_flight` in place and
+the Release in `Verifying`. Rollback is P6. `test_verify_failure_stops` asserts only what stays
+true after P6: exit 2, a `FAIL` VERIFY record, and `current` unchanged.
 
 **Definition of done**
-- [ ] The README walkthrough's first four commands run as written.
-- [ ] Every stage writes at least one audit record with `cmd`, and `history --verify` passes.
-- [ ] A `REJECTED` run creates no workload objects, Releases or ConfigMaps.
-- [ ] All P5 tests pass.
+- [x] The README walkthrough's first four commands run as written (validate 1.0.0; deploy 1.0.0 to
+      dev and staging; deploy 1.1.0 to dev; all exit 0).
+- [x] Every stage writes at least one audit record with `cmd`, and the audit chain verifies.
+      `history --verify` is P9; `test_audit_trail` uses `AuditLog.verify()`.
+- [x] A `REJECTED` run creates no workload objects, Releases or ConfigMaps. Only the Lease is
+      touched.
+- [x] All P5 tests pass (84 unit, 36 e2e; three consecutive green `make test` runs; e2e about 60 s).
 
 **Tests that must pass**
 
-| Test | Asserts |
-|---|---|
-| `tests/e2e/test_deploy.py::test_first_deploy` | Exit 0; outcome `SUCCEEDED`; Release `Succeeded`, attempts 1; `current == last_known_good`; bundle ConfigMap immutable; Lease released |
-| `tests/e2e/test_deploy.py::test_upgrade` | 1.0.0 then 1.1.0; `from`/`to` correct; pods run the 1.1.0 image |
-| `tests/e2e/test_deploy.py::test_promotion_chain` | dev → staging → prod all exit 0 |
-| `tests/e2e/test_deploy.py::test_slow_start` | Exit 0; `VERIFY` waited at least the stage delay |
-| `tests/e2e/test_deploy.py::test_audit_trail` | Stages appear in order with gap-free `seq`; `history --verify` exits 0 |
-| `tests/e2e/test_rejections.py::test_invalid_bundle_creates_nothing` | Exit 1; no objects with the app label exist |
-| `tests/e2e/test_rejections.py::test_promotion_gate` | Staging before dev gives exit 1 with a gate violation |
-| `tests/e2e/test_rejections.py::test_version_reused_different_image` | Exit 1; the violation cites the CEL immutability message from the server dry run |
-| `tests/e2e/test_rejections.py::test_version_reused_different_manifests` | Same Release, changed Deployment, gives exit 1 (immutable bundle ConfigMap) |
-| `tests/e2e/test_rejections.py::test_locked` | With the Lease held by another holder: exit 4, no other change |
-| `tests/unit/test_controller.py::test_deployment_id_stable` | Same inputs give the same ID; a different environment or digest gives a different ID |
+| Test | Asserts | Status |
+|---|---|---|
+| `tests/e2e/test_deploy.py::test_first_deploy` | Exit 0; `SUCCEEDED`; Release `Succeeded` with attempts 1; state `HEALTHY`, `current == last_known_good`, no `in_flight`; bundle ConfigMap immutable with digest; Lease released; managed-by label | ✅ |
+| `tests/e2e/test_deploy.py::test_upgrade` | 1.0.0 then 1.1.0: `from` and `to` correct; every live pod runs the 1.1.0 image | ✅ |
+| `tests/e2e/test_deploy.py::test_promotion_chain` | dev → staging → prod all exit 0; both gates `OK`; Release `Succeeded` in all three | ✅ |
+| `tests/e2e/test_deploy.py::test_slow_start` | Exit 0; VERIFY waited at least 4 s, over several polls | ✅ |
+| `tests/e2e/test_deploy.py::test_audit_trail` | Stages first appear in order VALIDATE, LOCK, PREPARE, DEPLOY, VERIFY, COMPLETE, and end with LOCK; `seq` is gap-free and equals the summary steps; every stage has a record with `cmd`; chain verifies | ✅ |
+| `tests/e2e/test_deploy.py::test_verify_failure_stops` | An `unhealthy` upgrade: exit 2, VERIFY `FAIL` with `ProgressDeadlineExceeded`, `current` still the previous release | ✅ |
+| `tests/e2e/test_rejections.py::test_invalid_bundle_creates_nothing` | Exit 1, `bundle:READINESS_PROBE`; no objects with the app label, not even a Lease | ✅ |
+| `tests/e2e/test_rejections.py::test_promotion_gate` | Staging before dev: exit 1, `promotion:GATE`, nothing created in staging | ✅ |
+| `tests/e2e/test_rejections.py::test_promotion_gate_needs_same_bundle` | Same Release, different replicas than dev: `promotion:GATE` | ✅ |
+| `tests/e2e/test_rejections.py::test_version_reused_different_image` | Exit 1, `immutability:RELEASE_SPEC`; the live Release keeps the original image | ✅ |
+| `tests/e2e/test_rejections.py::test_version_reused_different_manifests` | Same Release, changed Deployment: `immutability:BUNDLE`; live replicas unchanged | ✅ |
+| `tests/e2e/test_rejections.py::test_locked` | With the Lease held by another holder: exit 4, `LOCKED` naming the holder, nothing created, holder unchanged | ✅ |
+| `tests/e2e/test_rejections.py::test_degraded_gate` | `DEGRADED` state: exit 1 `environment:DEGRADED`; with `--allow-degraded`: exit 0 and `HEALTHY` | ✅ |
+| `tests/unit/test_controller.py::test_deployment_id_stable` | Stable; ignores defaulted `healthCheck`; changes with environment or bundle | ✅ |
+| `tests/unit/test_controller.py::test_in_cluster_manifests_carry_labels_and_digest` | Release, bundle ConfigMap and workloads carry the labels; digest annotations; the bundle itself is not mutated | ✅ |
+| `tests/unit/test_controller.py::test_outcome_exit_codes` | Every `Outcome` maps to the README exit code | ✅ |
+| `tests/unit/test_health.py::test_rollout_status[*]` | Six rollout states decided like `kubectl rollout status` | ✅ |
+| `tests/unit/test_health.py::test_verify_*` | VERIFY waits until complete (calling `on_poll` every poll), fails fast on the deadline, times out | ✅ |
 
 ---
 

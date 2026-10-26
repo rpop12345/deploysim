@@ -6,31 +6,30 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
 from deploysim import __version__
 from deploysim.audit import AuditError, AuditLog, Entry
+from deploysim.controller import ENVIRONMENTS, RELEASES, Controller, DeployRequest
 from deploysim.errors import EnvironmentProblem
+from deploysim.health import rollout_status
+from deploysim.kube import Kubectl, KubeError
+from deploysim.outcomes import ExitCode
 from deploysim.paths import Paths
+from deploysim.state import StateStore
 from deploysim.validate import ValidationResult, validate_file
 
-
-class ExitCode(IntEnum):
-    SUCCESS = 0
-    REJECTED = 1
-    ROLLED_BACK = 2
-    ROLLBACK_FAILED = 3
-    LOCKED = 4
-    ENVIRONMENT_ERROR = 5
-    USAGE = 64
+__all__ = ["ExitCode", "build_parser", "main"]
 
 
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--audit-log", type=Path, help="audit log path (default: .deploysim/audit.jsonl)"
+    )
+    common.add_argument(
+        "--kubeconfig", type=Path, help="simulator kubeconfig (default: .deploysim/kubeconfig)"
     )
 
     parser = argparse.ArgumentParser(
@@ -44,6 +43,20 @@ def build_parser() -> argparse.ArgumentParser:
         "validate", parents=[common], help="validate a release bundle offline (pass 1)"
     )
     validate.add_argument("file", type=Path, metavar="RELEASE_FILE")
+
+    deploy = commands.add_parser("deploy", parents=[common], help="deploy a release bundle")
+    deploy.add_argument("file", type=Path, metavar="RELEASE_FILE")
+    deploy.add_argument("--env", required=True, choices=ENVIRONMENTS)
+    deploy.add_argument(
+        "--allow-degraded", action="store_true", help="deploy into a DEGRADED environment"
+    )
+    deploy.add_argument(
+        "--lease-seconds", type=int, default=30, help="lock duration, renewed while running"
+    )
+
+    status = commands.add_parser("status", parents=[common], help="show state and live rollout")
+    status.add_argument("--app", required=True)
+    status.add_argument("--env", required=True, choices=ENVIRONMENTS)
     return parser
 
 
@@ -57,7 +70,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     paths = Paths.from_env()
     audit = AuditLog(args.audit_log or paths.audit_log)
     try:
-        return validate_command(args.file, paths, audit)
+        if args.command == "validate":
+            return validate_command(args.file, paths, audit)
+        if args.command == "deploy":
+            request = DeployRequest(args.file, args.env, args.allow_degraded, args.lease_seconds)
+            report = Controller(paths, audit, kubeconfig=args.kubeconfig).deploy(request)
+            emit(report.summary)
+            return report.outcome.exit_code
+        return status_command(args.app, args.env, paths, args.kubeconfig)
     except AuditError as exc:
         print(f"deploysim: audit log: {exc}", file=sys.stderr)
         return ExitCode.ENVIRONMENT_ERROR
@@ -99,6 +119,36 @@ def validate_command(file: Path, paths: Paths, audit: AuditLog) -> int:
         where = f"{violation.document}: " if violation.document else ""
         print(f"REJECTED {where}{violation.key}: {violation.message}", file=sys.stderr)
     return ExitCode.SUCCESS if result.ok else ExitCode.REJECTED
+
+
+def status_command(app: str, environment: str, paths: Paths, kubeconfig: Path | None) -> int:
+    try:
+        env = Kubectl.connect(paths, kubeconfig).environment(environment)
+        stored = StateStore(env, app).load()
+        selector = f"app.kubernetes.io/name={app}"
+        releases = env.get_labelled(RELEASES, selector).items()
+        deployments = env.get_labelled("deployments", selector).items()
+    except (EnvironmentProblem, KubeError) as exc:
+        print(f"deploysim: {exc}", file=sys.stderr)
+        return ExitCode.ENVIRONMENT_ERROR
+    emit(
+        {
+            "app": app,
+            "environment": environment,
+            "state": stored.state.to_dict(),
+            "releases": [
+                {
+                    "name": release["metadata"]["name"],
+                    "version": release["spec"]["version"],
+                    "phase": (release.get("status") or {}).get("phase"),
+                    "attempts": (release.get("status") or {}).get("attempts"),
+                }
+                for release in releases
+            ],
+            "rollout": [rollout_status(deployment).to_dict() for deployment in deployments],
+        }
+    )
+    return ExitCode.SUCCESS
 
 
 def summary(result: ValidationResult) -> dict[str, Any]:
