@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 
-from tests.e2e.support import ENVIRONMENTS, KUBECONFIG, NAME_LABEL, Kubectl
+from tests.e2e.support import (
+    ENVIRONMENTS,
+    KUBECONFIG,
+    NAME_LABEL,
+    CliRun,
+    Kubectl,
+    deploysim,
+)
 
 CLEANUP_KINDS = "deployments,services,configmaps,releases.deploysim.io,leases"
 
@@ -35,3 +43,16 @@ def app(kubectl: Kubectl) -> Iterator[str]:
             "--ignore-not-found",
             "--wait=false",
         )
+
+
+@pytest.fixture
+def audit_log(tmp_path: Path) -> Path:
+    return tmp_path / "audit.jsonl"
+
+
+@pytest.fixture
+def deploy(audit_log: Path) -> Callable[..., CliRun]:
+    def run(bundle: Path, env: str, *extra: str) -> CliRun:
+        return deploysim("deploy", str(bundle), "--env", env, *extra, audit_log=audit_log)
+
+    return run

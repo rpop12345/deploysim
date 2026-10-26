@@ -147,6 +147,12 @@ class Bundle:
         return int(health.get("timeoutSeconds", DEFAULT_TIMEOUT_SECONDS))
 
     @property
+    def spec(self) -> Manifest:
+        """The Release spec with the CRD's defaults filled in, as the API server stores it."""
+        health = {"timeoutSeconds": self.timeout_seconds}
+        return {**self.release["spec"], "healthCheck": health}
+
+    @property
     def deployments(self) -> tuple[Manifest, ...]:
         return tuple(obj for obj in self.objects if type_of(obj) == DEPLOYMENT_TYPE)
 

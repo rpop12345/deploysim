@@ -217,13 +217,17 @@ Two details matter here:
 
 ### Pass 2: against the target environment, while holding the lock
 
-| Check | Catches |
-|---|---|
-| Environment | `--env` is one of `dev`, `staging`, `prod`, and the namespace passes the safety guard |
-| Promotion gate | `staging` and `prod` only accept a Release whose identical spec has `Succeeded` in the previous environment |
-| Degraded environment | An environment whose last rollback failed rejects deploys unless `--allow-degraded` is passed |
-| Version immutability | A version already released with a different image or a different bundle. The API server enforces this too (see below). |
-| Server dry run | `kubectl apply --server-side --dry-run=server` of the Release and every workload object. Catches admission errors and immutable fields such as a changed Deployment selector. |
+| Check | Catches | Reported as |
+|---|---|---|
+| Environment | `--env` is not one of `dev`, `staging`, `prod` (the CLI refuses it as a usage error), or the namespace fails the safety guard (exit 5) | `environment:UNKNOWN` |
+| Degraded environment | An environment whose last rollback failed rejects deploys unless `--allow-degraded` is passed | `environment:DEGRADED` |
+| Promotion gate | `staging` and `prod` only accept a Release whose spec and bundle digest are identical to one that `Succeeded` in the previous environment | `promotion:GATE` |
+| Version immutability | A version already deployed in this environment with a different Release spec, or with different manifests (bundle digest). The API server enforces both too (see below). | `immutability:RELEASE_SPEC`, `immutability:BUNDLE` |
+| Server dry run | `kubectl apply --server-side --dry-run=server` of the Release, the bundle ConfigMap and every workload object. Catches admission errors and immutable fields such as a changed Deployment selector. | `server:DRY_RUN` |
+
+The degraded, promotion and immutability checks all run before the dry run, and every check that
+fails is reported. A rejected run changes nothing in the cluster: the Lease is taken and released,
+and that's all.
 
 Deploying an older version than the current one is allowed, since it is how an operator rolls back by
 hand. The audit record marks it `"downgrade": true`.
@@ -257,8 +261,8 @@ hand. The audit record marks it `"downgrade": true`.
 | `LOCK` | Creates the `Lease` `deploysim-<app>` in the environment namespace. A Lease held by a live run gives `LOCKED`. An expired Lease is taken over with a compare-and-swap write, and the takeover is audited. The Lease is renewed on every `VERIFY` poll. |
 | `RECOVER` | Runs when the state still has an `in_flight` record but no live run holds the Lease, which means the previous run died. Rolls back to that record's `previous` release and marks the interrupted attempt `Interrupted`. |
 | `PREPARE` | Writes `in_flight` (deployment ID, attempt, target, previous, stage) to the state ConfigMap. Stores the bundle in an immutable ConfigMap. Applies the `Release` and sets its phase to `Deploying`. All of this happens before the workload changes, so a crash at any later point is recoverable. |
-| `DEPLOY` | `kubectl apply --server-side --field-manager=deploysim` of the workload objects. |
-| `VERIFY` | Polls every Deployment in the bundle. It passes when the rollout is complete, the same condition `kubectl rollout status` checks: `observedGeneration` is current, and updated, ready and available replicas all equal `replicas`. It fails as soon as the `Progressing` condition reports `ProgressDeadlineExceeded`, or when `healthCheck.timeoutSeconds` elapses. |
+| `DEPLOY` | `kubectl apply --server-side --field-manager=deploysim --force-conflicts` of the workload objects, each labelled `app.kubernetes.io/managed-by: deploysim`. |
+| `VERIFY` | Polls every Deployment in the bundle every 0.5 s and renews the Lease on each poll. It passes when the rollout is complete, by the same rule `kubectl rollout status` uses: `observedGeneration` is current, no old replicas remain, and the updated and available replica counts equal `replicas`. It fails as soon as the `Progressing` condition reports `ProgressDeadlineExceeded`, or when `healthCheck.timeoutSeconds` elapses. |
 | `COMPLETE` | Sets `current` and `last_known_good` to the target, clears `in_flight`, and sets the Release phase to `Succeeded`. |
 | `ROLLBACK` | Re-applies the last known-good bundle from its immutable ConfigMap and verifies it the same way. On a first deployment there is nothing to restore: the bundle's objects are deleted and the environment returns to `EMPTY`. |
 
@@ -294,8 +298,8 @@ All state lives in the cluster, in the environment's namespace, so any runner se
 
 | Object | Name | Holds |
 |---|---|---|
-| `Release` (deploysim.io/v1alpha1) | `<app>-<version>` | What was asked for, and its status: phase, attempts, deployment ID, last transition |
-| `ConfigMap`, immutable | `deploysim-<app>-<version>` | The workload bundle exactly as applied, used for rollback |
+| `Release` (deploysim.io/v1alpha1) | `<app>-<version>` | What was asked for, annotated `deploysim.io/bundle-digest`, and its status: phase (`Deploying`, `Verifying`, `Succeeded`, …), attempts, deployment ID, message, last transition |
+| `ConfigMap`, immutable | `deploysim-<app>-<version>` | The workload objects under `objects.json`, annotated with the bundle digest, used for rollback |
 | `ConfigMap` | `deploysim-<app>` | Controller state: `current`, `last_known_good`, `in_flight`, `attempts`, `status` |
 | `Lease` | `deploysim-<app>` | The lock: holder, duration, renew time |
 
@@ -352,9 +356,11 @@ project root is the current directory, or `$DEPLOYSIM_ROOT` when set.
 
 What each command does:
 - `validate` runs pass 1 only. It needs no cluster.
-- `deploy` runs the full pipeline. It prints a JSON summary on stdout and progress lines on stderr.
+- `deploy` runs the full pipeline. It prints a JSON summary on stdout and one progress line per
+  audit record on stderr, for example `deploysim: VERIFY    rollout_status   OK`.
 - `recover` resolves an interrupted deployment without starting a new one.
-- `status` prints the state ConfigMap and the live rollout status.
+- `status` prints, as JSON, the state ConfigMap, every Release of the app in that environment with
+  its phase, and the live rollout status of its Deployments.
 - `history` prints audit records. `--verify` checks the hash chain and sequence numbers.
 
 ## Outputs
@@ -375,6 +381,7 @@ What each command does:
   "environment_status": "HEALTHY",
   "started_at": "2026-10-22T14:02:21.981Z",
   "finished_at": "2026-10-22T14:03:13.204Z",
+  "violations": [],
   "steps": [
     { "seq": 41, "stage": "VALIDATE", "action": "kubectl_validate",  "result": "OK" },
     { "seq": 42, "stage": "VALIDATE", "action": "bundle_policy",     "result": "OK" },
@@ -497,8 +504,10 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 | `tests/unit/test_kube.py` | The safety guard refuses a remote server, a missing kubeconfig, or an unknown context, before any process runs; every call pins `--kubeconfig` and `$KUBECONFIG`; recorded kubectl errors are classified correctly; only `kube.py` and `validate.py` start processes | Never touch a real environment |
 | `tests/e2e/test_kube.py` | An unlabelled or missing namespace is refused; a Lease is exclusive, renewable, released and taken over after expiry; a stale holder's renew and release fail with `Conflict`; state round-trips and a stale save fails with `Conflict`; drift sees real changes and never controller updates (20 fresh Deployments) | Safe to retry, never ambiguous |
 | `tests/e2e/test_environment.py` | Nodes Ready; environment namespaces labelled; Release CRD name and immutability rules enforced by the API server; status subresource and printer columns; each KWOK stage (ready, `unhealthy`, `slow-start`) behaves as documented; `schemas/` matches the cluster | The simulated environment |
-| `tests/e2e/test_deploy.py` | First deployment; upgrade; promotion dev → staging → prod; `slow-start` succeeds after waiting; Release, state and audit are correct | Successful deployment |
-| `tests/e2e/test_rejections.py` | Invalid bundle is rejected with zero objects created; promotion gate; version re-used with a different image (rejected by the API server's CEL rule); degraded gate | Invalid input |
+| `tests/unit/test_controller.py` | Deployment ID is stable, ignores defaulted fields, and changes with environment or bundle; in-cluster manifests carry labels and the bundle digest; outcome-to-exit-code mapping | Audit-friendly result |
+| `tests/unit/test_health.py` | Rollout decision for every state (unobserved, updating, terminating, unavailable, complete, deadline exceeded); the VERIFY loop waits, fails fast on the deadline, and times out | Simulated health check |
+| `tests/e2e/test_deploy.py` | First deployment (Release, state, bundle ConfigMap, Lease released, labels); upgrade replaces every pod; promotion dev → staging → prod; `slow-start` succeeds after waiting; audit trail in stage order with commands; a failed health check exits 2 and leaves `current` untouched | Successful deployment, failed health check |
+| `tests/e2e/test_rejections.py` | An invalid bundle creates nothing; the promotion gate rejects a release new to staging and a changed bundle; reusing a version with a different image or manifests is rejected; a held Lease gives exit 4 and changes nothing; a `DEGRADED` environment needs `--allow-degraded` | Invalid input, repeated execution |
 | `tests/e2e/test_rollback.py` | Unhealthy upgrade rolls back to the previous release and old pods keep serving; unhealthy first deployment returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3 | Failed health check, rollback |
 | `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`; manual drift is corrected; retry after rollback is attempt 2; a concurrent run gets `LOCKED` and changes nothing | Repeated execution |
 | `tests/e2e/test_recovery.py` | `crash-after-deploy`, then the next `deploy` (and separately `recover`) restores the last known-good release and marks the attempt `Interrupted` | Never ambiguous |

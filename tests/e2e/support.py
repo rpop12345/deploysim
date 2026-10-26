@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
+
+import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 KUBECONFIG = REPO / ".deploysim" / "kubeconfig"
@@ -131,3 +136,78 @@ def progress_deadline_exceeded(dep: Manifest) -> bool:
         and c.get("reason") == "ProgressDeadlineExceeded"
         for c in dep.get("status", {}).get("conditions", [])
     )
+
+
+def bundle_documents(
+    app: str,
+    version: str = "1.0.0",
+    *,
+    image_seed: str | None = None,
+    replicas: int = 2,
+    fault: str | None = None,
+    progress_deadline: int = 10,
+    timeout: int = 20,
+    readiness: bool = True,
+) -> list[Manifest]:
+    """A release bundle that passes validation unless readiness=False."""
+    image_ref = image(app, image_seed or version)
+    release_doc = release(app, version, image_ref)
+    release_doc["spec"]["healthCheck"] = {"timeoutSeconds": timeout}
+    del release_doc["metadata"]["labels"]
+    workload = deployment(
+        app, version=version, replicas=replicas, fault=fault, progress_deadline=progress_deadline
+    )
+    [container] = workload["spec"]["template"]["spec"]["containers"]
+    container["image"] = image_ref
+    if not readiness:
+        del container["readinessProbe"]
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": app, "labels": {NAME_LABEL: app}},
+        "spec": {"selector": {NAME_LABEL: app}, "ports": [{"port": 80, "targetPort": 8080}]},
+    }
+    return [release_doc, workload, service]
+
+
+def write_bundle(directory: Path, app: str, version: str = "1.0.0", **options: Any) -> Path:
+    path = directory / f"{app}-{version}-{len(list(directory.glob('*.yaml')))}.yaml"
+    path.write_text(yaml.safe_dump_all(bundle_documents(app, version, **options)))
+    return path
+
+
+@dataclass(frozen=True)
+class CliRun:
+    code: int
+    summary: Manifest
+    stderr: str
+
+
+def deploysim(*args: str, audit_log: Path) -> CliRun:
+    """Runs the deploysim CLI from the repository root and parses its JSON summary."""
+    env = {**os.environ, "DEPLOYSIM_ROOT": str(REPO)}
+    result = subprocess.run(
+        [sys.executable, "-m", "deploysim", *args, "--audit-log", str(audit_log)],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=REPO,
+        check=False,
+    )
+    try:
+        summary: Manifest = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        summary = {}
+    return CliRun(result.returncode, summary, result.stderr)
+
+
+def state_of(kubectl: Kubectl, app: str, namespace: str) -> Manifest:
+    configmap = kubectl.get("configmap", f"deploysim-{app}", "-n", namespace)
+    loaded: Manifest = json.loads(configmap["data"]["state.json"])
+    return loaded
+
+
+def labelled(kubectl: Kubectl, kinds: str, app: str, namespace: str) -> list[str]:
+    """kind/name of every object of kinds carrying the app's name label."""
+    items = kubectl.get(kinds, "-n", namespace, "-l", f"{NAME_LABEL}={app}")["items"]
+    return [f"{item['kind']}/{item['metadata']['name']}" for item in items]
