@@ -589,29 +589,39 @@ pyproject.toml
 
 ### Included workflow (`.github/workflows/ci.yml`)
 
-Runs on every pull request and push to `main`:
+Runs on every pull request and push to `main`. Every action is pinned to a commit SHA.
 
 ```
 lint ──────┐
-unit ──────┼──► package ──► e2e (KWOK)
-manifests ─┘
+unit ──────┤   (all four start together; e2e waits for package)
+manifests ─┤
+package ───┴──► e2e (KWOK)
 ```
 
 | Job | Steps |
 |---|---|
-| `lint` | `ruff check`, `ruff format --check`, `mypy --strict`, `shellcheck scripts/*.sh` |
-| `unit` | `make tools`, then `pytest tests/unit` |
-| `manifests` | `deploysim validate` on every file in `examples/`, so every example bundle must pass |
-| `package` | `python -m build` (wheel + sdist), `SHA256SUMS`, CycloneDX SBOM, build provenance attestation, uploaded as workflow artifacts |
-| `e2e` | `make tools cluster-up`, install the built wheel into a clean venv, server-side dry run of `crds/release.yaml`, `make schemas` followed by `git diff --exit-code schemas/`, `pytest tests/e2e`, `scripts/demo.sh`. On failure it uploads the audit log, `kwokctl logs`, and `kubectl get events -A`. The cluster is always deleted at the end. |
+| `lint` | `make lint`: `ruff check`, `ruff format --check`, `mypy --strict`, `shellcheck scripts/*.sh`, `actionlint` |
+| `unit` | `make tools`, then `pytest tests/unit` on Python 3.11 and 3.14 |
+| `manifests` | `kubectl-validate crds/`, then `deploysim validate` on every file in `examples/`; every bundle must pass |
+| `package` | `make package`: wheel, sdist, CycloneDX SBOM of the installed wheel, `SHA256SUMS`. On pushes to `main`, a build provenance attestation of the wheel and sdist. Uploaded as the `dist` artifact. |
+| `e2e` | Installs the `dist` wheel into a clean venv and moves the checkout's `deploysim/` aside, so every import, including the CLI that the tests and demo start, is the wheel. Then `make cluster-up`, `make schemas` followed by `git diff --exit-code schemas/`, `pytest -m e2e tests/e2e`, and `scripts/demo.sh`. On failure it uploads `e2e-diagnostics`: `kwokctl logs` for each component, `kubectl get events -A`, the objects as YAML, and every audit log the tests and demo wrote. The cluster is always deleted at the end. |
 
 Three details are deliberate:
-- **The e2e job installs the built wheel, not the checkout.** It tests what would ship.
-- **The CRD gets a server dry run.** kubectl-validate does not validate a CRD definition the way the
-  API server does. It accepted a schema the server rejects (`additionalProperties` combined with
-  `properties`).
+- **The e2e job tests the wheel, not the checkout.** A packaging mistake, such as a module left out
+  of the wheel, fails CI.
+- **The Release CRD is validated twice.** `kubectl-validate crds/` checks it offline, and
+  `make cluster-up` applies it to a real API server. When `deploysim validate` loads it with
+  `--local-crds` to check Releases, kubectl-validate does not re-check the CRD itself: a schema
+  combining `additionalProperties` with `properties`, which the API server rejects, is silently
+  accepted there.
 - **`make tools` downloads kwokctl, kwok, kubectl and kubectl-validate by exact version and verifies
-  each against a SHA-256 pinned in the `Makefile`.** CI and laptops run identical tools.
+  each against a SHA-256 pinned in the `Makefile`.** CI and laptops run identical tools; `bin/` and
+  `~/.kwok/cache` are cached between runs.
+
+Failure paths, checked locally:
+- an example bundle with an unknown field fails `manifests`;
+- `schemas/` out of date with the cluster fails the `git diff` step of `e2e`;
+- that invalid CRD fails `kubectl-validate crds/` and the API server's apply.
 
 ### What a production pipeline adds
 

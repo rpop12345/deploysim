@@ -35,8 +35,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P6 Rollback and degraded environments | ✅ Done | `e4a0f66` (PR #6, merged as `bad0cf1`) |
 | P7 Idempotency, drift and retries | ✅ Done | `206bdf6` (PR #7, merged as `1661258`) |
 | P8 Crash recovery | ✅ Done | `fb15d64` (PR #8, merged as `296a390`) |
-| P9 CLI completeness and demo | ✅ Done | not yet committed |
-| P10 CI complete | ⬜ Not started | |
+| P9 CLI completeness and demo | ✅ Done | `4076f2f` (PR #9, merged as `38034e6`) |
+| P10 CI complete | ✅ Done locally; ⏳ GitHub run | not yet committed |
 | P11 Documentation pass | ⬜ Not started | |
 
 ## Phase overview
@@ -622,35 +622,69 @@ them all.
 
 ## P10: CI complete
 
+**Status:** ✅ Done locally; the green run on GitHub and the wall time are confirmed on this phase's
+PR
+
 **Goal:** the README's CI workflow, running green on GitHub.
 
 **Deliverables**
-- `.github/workflows/ci.yml` jobs `lint`, `unit`, `manifests`, `package` and `e2e`, as described in
-  the README CI section.
-- Caches for `bin/` and `~/.kwok/cache`, keyed on the pinned versions.
-- `e2e` job:
-  - installs the built wheel into a clean venv;
-  - dry-runs the CRD against the server;
-  - runs `make schemas` and `git diff --exit-code schemas/`;
-  - on failure, uploads the audit log, `kwokctl logs` and `kubectl get events -A`;
-  - always deletes the cluster.
-- `package` job: wheel, sdist, `SHA256SUMS`, CycloneDX SBOM, and `actions/attest-build-provenance`.
+- `.github/workflows/ci.yml`:
+  - jobs `lint`, `unit` (Python 3.11 and 3.14), `manifests` and `package` start in parallel; `e2e`
+    needs only `package`;
+  - every action is pinned to the commit SHA of a release at least two weeks old;
+  - `bin/` and `~/.kwok/cache` are cached, keyed on the pinned versions.
+- `manifests`: `kubectl-validate crds/` (offline) plus `deploysim validate` on every example.
+- `package` runs `make package`:
+  - wheel and sdist;
+  - a CycloneDX SBOM generated from a venv with the wheel installed;
+  - `SHA256SUMS`;
+  - on pushes to `main`, `actions/attest-build-provenance` for the wheel and sdist (the job alone
+    gets `id-token: write` and `attestations: write`);
+  - uploaded as the `dist` artifact.
+- `e2e`:
+  - installs the `dist` wheel and pytest into a clean venv;
+  - moves the checkout's `deploysim/` aside and asserts that `import deploysim` resolves to
+    site-packages, so the tests and demo run the wheel;
+  - `make cluster-up` (its CRD apply is the server-side check);
+  - `make schemas` and `git diff --exit-code schemas/`;
+  - `pytest -m e2e tests/e2e`, then `scripts/demo.sh` with `DEPLOYSIM` and `AUDIT_LOG`;
+  - on failure, uploads `e2e-diagnostics` (component logs, events, objects, every audit log);
+  - always runs `make cluster-down`.
+- `make lint` adds `actionlint` (`actionlint-py`, pinned).
+- `scripts/demo.sh` honours `AUDIT_LOG`.
+
+**Changes from the original plan**
+- The separate CRD server dry-run step was dropped. `make cluster-up` already applies
+  `crds/release.yaml` to the API server, so an invalid CRD fails `e2e` there. `manifests` also
+  catches it offline.
+- Correction to P1's finding: kubectl-validate does reject the invalid CRD when validating the
+  CRD document. It only accepts it when loading it through `--local-crds`.
+- By your choice, the negative checks were proven locally rather than through throwaway PRs.
 
 **Definition of done**
-- [ ] The workflow is green on a pull request and on `main`.
-- [ ] `actionlint` is clean.
-- [ ] Full workflow wall time is under 10 minutes.
-- [ ] Each negative check below fails the job it names.
+- [ ] The workflow is green on a pull request and on `main` (this phase's PR).
+- [x] `actionlint` is clean, and runs in `make lint`.
+- [ ] Full workflow wall time is under 10 minutes (measured on this phase's PR).
+- [x] Each negative check fails the step it names, verified locally:
+      - broken example: the `manifests` loop exits 1;
+      - stale schemas: `git diff --exit-code` exits 1;
+      - `additionalProperties` beside `properties` in the CRD: `kubectl-validate crds/` exits 1,
+        and the server apply exits 1.
+      Diagnostics upload is only exercised by a real failing CI run.
+- [x] The e2e job's steps, replayed locally in a clean copy on a throwaway cluster
+      (`deploysim-ci`): the wheel resolves from site-packages, schemas match, 61 e2e tests pass,
+      and the demo passes 23 of 23.
 
 **Tests that must pass**
 
-| Check | Expected |
-|---|---|
-| Green run on a PR | All jobs pass |
-| A PR breaking an example bundle | `manifests` fails |
-| A PR with stale `schemas/` | `e2e` fails at `git diff --exit-code` |
-| A PR adding `additionalProperties: false` beside `properties` in the CRD | `e2e` fails at the server dry run |
-| A PR failing an e2e test | Diagnostics artifacts are uploaded; the cluster is deleted |
+| Check | Expected | Status |
+|---|---|---|
+| Green run on a PR | All jobs pass | ⏳ this phase's PR |
+| A PR breaking an example bundle | `manifests` fails | ✅ local: exit 1 |
+| A PR with stale `schemas/` | `e2e` fails at `git diff --exit-code` | ✅ local: exit 1 |
+| A PR adding `additionalProperties: false` beside `properties` in the CRD | `manifests` fails (`kubectl-validate crds/`); `e2e` fails at `make cluster-up` | ✅ local: both exit 1 |
+| A PR failing an e2e test | Diagnostics artifacts are uploaded; the cluster is deleted | ⏳ only on a real failing run |
+| Replay of the `e2e` job against the wheel | 61 e2e passed; demo 23 of 23 | ✅ |
 
 ---
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Runs every deploysim scenario against the KWOK cluster and checks each exit code.
-# Usage: scripts/demo.sh after make cluster-up; needs jq.
-# DEPLOYSIM overrides the CLI binary; KEEP=1 keeps the demo app and audit log.
+# Usage: scripts/demo.sh after make cluster-up; needs jq. DEPLOYSIM overrides the CLI binary,
+# AUDIT_LOG the audit log path; KEEP=1 keeps the demo app and audit log.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 deploysim=${DEPLOYSIM:-.venv/bin/deploysim}
 app="demo-$(date +%s)"
 work=$(mktemp -d)
-audit="$work/audit.jsonl"
+audit=${AUDIT_LOG:-$work/audit.jsonl}
 scenarios=0
 failures=0
 
