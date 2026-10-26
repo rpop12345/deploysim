@@ -93,7 +93,14 @@ class AuditLog:
         self._clock = clock
 
     def append(self, entry: Entry) -> AuditRecord:
-        """Appends one record under an exclusive lock, then flushes and fsyncs it."""
+        """Appends one record under an exclusive lock, then flushes and fsyncs it.
+        Raises AuditError when the log cannot be written, e.g. a read-only path or /dev/null."""
+        try:
+            return self._append(entry)
+        except OSError as exc:
+            raise AuditError(f"{self.path}: cannot write: {exc.strerror or exc}") from exc
+
+    def _append(self, entry: Entry) -> AuditRecord:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a+b") as f:
             fcntl.flock(f, fcntl.LOCK_EX)

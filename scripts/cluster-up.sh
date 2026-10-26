@@ -52,6 +52,9 @@ fi
 kubectl apply --server-side --field-manager=deploysim-setup -f kwok/cluster.yaml -f crds/release.yaml
 kubectl wait --for condition=Established crd/releases.deploysim.io --timeout 30s
 kubectl wait --for condition=Ready node --all --timeout 60s
+for namespace in kube-system dev staging prod; do
+  kubectl wait --for=create serviceaccount/default -n "$namespace" --timeout 60s >/dev/null
+done
 
 canary="deploysim-canary-$$"
 kubectl run "$canary" -n kube-system --image=registry.k8s.io/pause:3.10 --restart=Never >/dev/null

@@ -12,6 +12,7 @@ dependencies = ["PyYAML>=6.0,<7"]
 
 [project.optional-dependencies]
 dev = [
+  "actionlint-py==1.7.12.25",
   "build==1.6.1",
   "cyclonedx-bom==7.5.0",
   "mypy==2.4.0",

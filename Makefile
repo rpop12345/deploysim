@@ -69,11 +69,12 @@ install-dev: ## Create .venv with deploysim and dev tools
 	$(VBIN)/pip install --quiet --upgrade pip
 	$(VBIN)/pip install --quiet -e '.[dev]'
 
-lint: ## ruff, mypy --strict, shellcheck
+lint: ## ruff, mypy --strict, shellcheck, actionlint
 	$(VBIN)/ruff check .
 	$(VBIN)/ruff format --check .
 	$(VBIN)/mypy
 	$(VBIN)/shellcheck scripts/*.sh
+	$(VBIN)/actionlint .github/workflows/*.yml
 
 fmt: ## Apply ruff fixes and formatting
 	$(VBIN)/ruff check --fix .
@@ -88,8 +89,13 @@ test-e2e: ## End-to-end tests; needs make cluster-up
 test: ## All tests, with an 85% coverage gate; needs make cluster-up
 	$(VBIN)/pytest tests/unit tests/e2e --cov --cov-fail-under=85
 
-package: ## Build wheel and sdist into dist/
-	$(VBIN)/python -m build
+package: ## Wheel, sdist, CycloneDX SBOM and SHA256SUMS into dist/
+	rm -rf dist build/sbom-venv
+	$(VBIN)/python -m build --outdir dist
+	$(PYTHON) -m venv build/sbom-venv
+	build/sbom-venv/bin/pip install --quiet dist/*.whl
+	$(VBIN)/cyclonedx-py environment build/sbom-venv/bin/python --of JSON -o dist/deploysim.cdx.json
+	cd dist && shasum -a 256 *.whl *.tar.gz deploysim.cdx.json >SHA256SUMS
 
 clean: ## Remove build, test and lint caches
 	rm -rf build dist ./*.egg-info .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov
