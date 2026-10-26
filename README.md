@@ -230,7 +230,8 @@ fails is reported. A rejected run changes nothing in the cluster: the Lease is t
 and that's all.
 
 Deploying an older version than the current one is allowed, since it is how an operator rolls back by
-hand. The audit record marks it `"downgrade": true`.
+hand. The `PREPARE record_intent` audit record marks it `"downgrade": true`. Versions are compared by
+semantic-version precedence, so `1.0.0-rc.1` < `1.0.0` < `1.10.0`.
 
 ## How a deployment runs
 
@@ -381,6 +382,7 @@ What each command does:
   "to": "orders-api-1.1.0",
   "outcome": "ROLLED_BACK",
   "rollback": { "performed": true, "to": "orders-api-1.0.0", "result": "SUCCEEDED" },
+  "drift_corrected": false,
   "final": "orders-api-1.0.0",
   "environment_status": "HEALTHY",
   "started_at": "2026-10-22T14:02:21.981Z",
@@ -404,6 +406,8 @@ What each command does:
 
 `deployment_id` is derived from `sha256(app | environment | release spec | bundle digest)`, so the
 same release to the same environment always gets the same ID, and its attempts can be counted.
+`attempt` is assigned at `PREPARE`. It is `null` when no deployment was attempted: `REJECTED`,
+`LOCKED` and `NO_OP`.
 
 ### Audit log
 
@@ -440,8 +444,8 @@ out". Re-running a command is always safe.
 
 | Situation when `deploy` runs | Result |
 |---|---|
-| Target is current, applying its bundle would change nothing (see below), and the rollout is healthy | `NO_OP`, exit 0, recorded in the audit log |
-| Target is current but has drifted or is unhealthy | Re-applied and verified. The summary marks `"drift_corrected": true`. |
+| Target is current, applying its bundle would change nothing (see below), and the rollout is healthy | `NO_OP`, exit 0. Nothing is written except the Lease; the `desired_state` audit record shows the check. |
+| Target is current but has drifted or is unhealthy | Re-applied and verified as the next attempt. The summary marks `"drift_corrected": true`, and `desired_state` lists the drifted objects. |
 | A different release is current | Normal deployment |
 | This release was previously rolled back | Deploys again as attempt N+1. Transient failures are common, and the attempt count shows in the Release status and the audit log. |
 | A previous run died (`in_flight` present, Lease expired) | `RECOVER` first, then deploy as attempt N+1 |
@@ -513,7 +517,8 @@ cluster without interfering, and a short `progressDeadlineSeconds` so the failur
 | `tests/e2e/test_deploy.py` | First deployment (Release, state, bundle ConfigMap, Lease released, labels); upgrade replaces every pod; promotion dev → staging → prod; `slow-start` succeeds after waiting; audit trail in stage order with commands; a failed health check exits 2 and leaves `current` untouched | Successful deployment, failed health check |
 | `tests/e2e/test_rejections.py` | An invalid bundle creates nothing; the promotion gate rejects a release new to staging and a changed bundle; reusing a version with a different image or manifests is rejected; a held Lease gives exit 4 and changes nothing; a `DEGRADED` environment needs `--allow-degraded` | Invalid input, repeated execution |
 | `tests/e2e/test_rollback.py` | `--inject-fault unhealthy` upgrade rolls back to the previous release, and its pods keep serving: ready old pods never drop below `replicas - maxUnavailable`, sampled throughout; the stored bundle stays unannotated; a broken build (fault in the bundle) rolls back; an unhealthy first deployment removes its objects and returns to `EMPTY`; `unhealthy-rollback` ends `DEGRADED` with exit 3; a `DEGRADED` environment needs `--allow-degraded`. After every scenario there is no `in_flight` record. | Failed health check, rollback |
-| `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`; manual drift is corrected; retry after rollback is attempt 2; a concurrent run gets `LOCKED` and changes nothing | Repeated execution |
+| `tests/e2e/test_idempotency.py` | Same release twice gives `NO_OP`, with no write step and the state, Release, Deployment generation and ReplicaSets unchanged; a manual `kubectl scale` is detected and corrected; retry after rollback is attempt 2 with the same deployment ID; two concurrent deploys give exactly one exit 0 and one exit 4, with consistent state; a downgrade is flagged | Repeated execution |
+| `tests/unit/test_bundle.py` | Semantic-version precedence, using the specification's own ordering example | Repeated execution |
 | `tests/e2e/test_recovery.py` | `crash-after-deploy`, then the next `deploy` (and separately `recover`) restores the last known-good release and marks the attempt `Interrupted` | Never ambiguous |
 
 ## Project layout

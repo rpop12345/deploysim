@@ -108,6 +108,18 @@ def structure_violations(docs: list[Any]) -> list[Violation]:
     return violations
 
 
+def version_key(version: str) -> tuple[Any, ...]:
+    """Sort key giving semantic-version precedence: 1.0.0-rc.1 < 1.0.0 < 1.0.1 < 1.1.0."""
+    core, _, prerelease = version.partition("-")
+    major, minor, patch = (int(part) for part in core.split("."))
+    if not prerelease:
+        return (major, minor, patch, 1, ())
+    identifiers = tuple(
+        (0, int(part), "") if part.isdigit() else (1, 0, part) for part in prerelease.split(".")
+    )
+    return (major, minor, patch, 0, identifiers)
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
