@@ -6,8 +6,9 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from deploysim import __version__
 from deploysim.audit import AuditError, AuditLog, Entry
@@ -30,8 +31,16 @@ from deploysim.validate import ValidationResult, validate_file
 __all__ = ["ExitCode", "build_parser", "main"]
 
 
+class Parser(argparse.ArgumentParser):
+    """Exits 64 (EX_USAGE) on usage errors; argparse's default 2 would mean ROLLED_BACK."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(ExitCode.USAGE, f"{self.prog}: error: {message}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
+    common = Parser(add_help=False)
     common.add_argument(
         "--audit-log", type=Path, help="audit log path (default: .deploysim/audit.jsonl)"
     )
@@ -39,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--kubeconfig", type=Path, help="simulator kubeconfig (default: .deploysim/kubeconfig)"
     )
 
-    parser = argparse.ArgumentParser(
+    parser = Parser(
         prog="deploysim",
         description="Promote versioned releases through a simulated KWOK environment.",
     )
@@ -76,6 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", parents=[common], help="show state and live rollout")
     status.add_argument("--app", required=True)
     status.add_argument("--env", required=True, choices=ENVIRONMENTS)
+
+    history = commands.add_parser(
+        "history", parents=[common], help="print audit records, or verify the log"
+    )
+    history.add_argument("--app")
+    history.add_argument("--env", choices=ENVIRONMENTS)
+    history.add_argument("--deployment-id")
+    history.add_argument(
+        "--verify", action="store_true", help="check the hash chain and sequence numbers"
+    )
     return parser
 
 
@@ -83,8 +102,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
-        parser.print_help()
-        return ExitCode.SUCCESS
+        parser.print_help(sys.stderr)
+        return ExitCode.USAGE
 
     paths = Paths.from_env()
     audit = AuditLog(args.audit_log or paths.audit_log)
@@ -107,6 +126,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = Controller(paths, audit, kubeconfig=args.kubeconfig).recover(recovery)
             emit(report.summary)
             return report.outcome.exit_code
+        if args.command == "history":
+            return history_command(audit, args.app, args.env, args.deployment_id, args.verify)
         return status_command(args.app, args.env, paths, args.kubeconfig)
     except AuditError as exc:
         print(f"deploysim: audit log: {exc}", file=sys.stderr)
@@ -149,6 +170,29 @@ def validate_command(file: Path, paths: Paths, audit: AuditLog) -> int:
         where = f"{violation.document}: " if violation.document else ""
         print(f"REJECTED {where}{violation.key}: {violation.message}", file=sys.stderr)
     return ExitCode.SUCCESS if result.ok else ExitCode.REJECTED
+
+
+def history_command(
+    audit: AuditLog, app: str | None, env: str | None, deployment_id: str | None, verify: bool
+) -> int:
+    """Records as JSON lines; with --verify, one JSON report and exit 1 if the log was altered."""
+    if verify:
+        problems = audit.verify()
+        records = len(audit.path.read_text().splitlines()) if audit.path.exists() else 0
+        emit(
+            {
+                "audit_log": str(audit.path),
+                "records": records,
+                "verified": not problems,
+                "problems": [asdict(problem) for problem in problems],
+            }
+        )
+        for problem in problems:
+            print(f"ALTERED line {problem.line}: {problem.message}", file=sys.stderr)
+        return ExitCode.REJECTED if problems else ExitCode.SUCCESS
+    for record in audit.records(app=app, environment=env, deployment_id=deployment_id):
+        print(json.dumps(record.to_dict(), separators=(",", ":")))
+    return ExitCode.SUCCESS
 
 
 def status_command(app: str, environment: str, paths: Paths, kubeconfig: Path | None) -> int:

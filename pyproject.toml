@@ -47,3 +47,11 @@ files = ["deploysim", "tests"]
 testpaths = ["tests/unit"]
 addopts = "-ra --strict-markers"
 markers = ["e2e: needs a running KWOK cluster (make cluster-up)"]
+
+[tool.coverage.run]
+source = ["deploysim"]
+patch = ["subprocess"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
