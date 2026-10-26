@@ -1,10 +1,12 @@
-"""deploy: VALIDATE, LOCK, cluster validation, PREPARE, DEPLOY, VERIFY, COMPLETE."""
+"""deploy and recover: VALIDATE, LOCK, RECOVER, cluster validation, PREPARE, DEPLOY, VERIFY,
+then COMPLETE or ROLLBACK."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
 import json
+import os
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -30,7 +32,7 @@ from deploysim.kube import (
     managed_labels,
 )
 from deploysim.lease import HeldLease, Locked, acquire, default_holder, release, renew
-from deploysim.outcomes import Outcome
+from deploysim.outcomes import ExitCode, Outcome
 from deploysim.paths import Paths
 from deploysim.state import InFlight, LastOutcome, ReleaseRef, StateStore, Status, Stored
 from deploysim.validate import validate_file
@@ -40,7 +42,13 @@ RELEASES = "releases.deploysim.io"
 DIGEST_ANNOTATION = "deploysim.io/bundle-digest"
 FAULT_ANNOTATION = "deploysim.io/fault"
 BUNDLE_KEY = "objects.json"
-FAULTS = ("unhealthy", "unhealthy-rollback")
+FAULTS = (
+    "unhealthy",
+    "unhealthy-rollback",
+    "crash-after-prepare",
+    "crash-after-deploy",
+    "crash-during-rollback",
+)
 
 Detail = dict[str, Any]
 
@@ -133,11 +141,20 @@ class DeployRequest:
 
     @property
     def target_fault(self) -> str | None:
-        return "unhealthy" if self.inject_fault in FAULTS else None
+        unhealthy_target = ("unhealthy", "unhealthy-rollback", "crash-during-rollback")
+        return "unhealthy" if self.inject_fault in unhealthy_target else None
 
     @property
     def rollback_fault(self) -> str | None:
         return "unhealthy" if self.inject_fault == "unhealthy-rollback" else None
+
+
+@dataclass(frozen=True)
+class RecoverRequest:
+    app: str
+    environment: str
+    lease_seconds: int = 30
+    holder: str = field(default_factory=default_holder)
 
 
 @dataclass(frozen=True)
@@ -169,6 +186,12 @@ class Run:
         self.to_release: str | None = None
         self.final_release: str | None = None
         self.environment_status: Status | None = None
+        self.recovery: Detail = {
+            "performed": False,
+            "interrupted": None,
+            "to": None,
+            "result": None,
+        }
         self.rollback: Detail = {"performed": False, "to": None, "result": None}
         self.drift_corrected = False
         self.steps: list[Detail] = []
@@ -210,6 +233,7 @@ class Run:
             "from": self.from_release,
             "to": self.to_release,
             "outcome": ending.outcome.value,
+            "recovery": self.recovery,
             "rollback": self.rollback,
             "drift_corrected": self.drift_corrected,
             "final": self.final_release,
@@ -247,9 +271,12 @@ class Controller:
     def deploy(self, request: DeployRequest) -> DeployReport:
         return Deploy(self, request).execute()
 
+    def recover(self, request: RecoverRequest) -> DeployReport:
+        return Recover(self, request).execute()
+
 
 class LeaseKeeper:
-    """Holds this run's Lease: renewed on every VERIFY poll, released at the end."""
+    """Holds this run's Lease: renewed on every rollout poll, released at the end."""
 
     def __init__(self, lease: HeldLease, clock: Callable[[], datetime]) -> None:
         self.lease: HeldLease | None = lease
@@ -276,14 +303,12 @@ class LeaseKeeper:
         run.record("LOCK", "release_lease", "OK", cmd=cmd)
 
 
-class Deploy:
-    """One deploysim deploy invocation, up to holding the Lease."""
+class Invocation:
+    """One CLI command: maps environment problems to exit 5 and always releases the Lease."""
 
-    def __init__(self, controller: Controller, request: DeployRequest) -> None:
+    def __init__(self, controller: Controller, environment: str) -> None:
         self.ctl = controller
-        self.request = request
-        started = controller.clock()
-        self.run = Run(controller.audit, controller.progress, request.environment, started)
+        self.run = Run(controller.audit, controller.progress, environment, controller.clock())
         self.keeper: LeaseKeeper | None = None
 
     def execute(self) -> DeployReport:
@@ -298,17 +323,45 @@ class Deploy:
         return DeployReport(ending.outcome, self.run.summary(ending, self.ctl.clock()))
 
     def _execute(self) -> Ending:
+        raise NotImplementedError
+
+    def _lock(self, env: Environment, app: str, holder: str, seconds: int) -> Ending | None:
+        try:
+            lease = acquire(env, app, holder, seconds, self.ctl.clock())
+        except Locked as exc:
+            expires = iso_millis(exc.expires_at) if exc.expires_at else None
+            detail: Detail = {"holder": exc.holder, "expires_at": expires}
+            self.run.record("LOCK", "acquire_lease", "LOCKED", detail=detail)
+            return Ending(Outcome.LOCKED, error=f"lease {exc}")
+        detail = {"holder": lease.holder, "took_over_from": lease.took_over_from}
+        self.run.record("LOCK", "acquire_lease", "OK", cmd=lease.cmd, detail=detail)
+        self.keeper = LeaseKeeper(lease, self.ctl.clock)
+        return None
+
+
+class Deploy(Invocation):
+    """deploysim deploy."""
+
+    def __init__(self, controller: Controller, request: DeployRequest) -> None:
+        super().__init__(controller, request.environment)
+        self.request = request
+
+    def _execute(self) -> Ending:
+        request = self.request
         bundle = self._validate_offline()
         if isinstance(bundle, Ending):
             return bundle
         kubectl = Kubectl.connect(self.ctl.paths, self.ctl.kubeconfig)
-        env = kubectl.environment(self.request.environment)
-        lease = self._lock(env, bundle)
-        if isinstance(lease, Ending):
-            return lease
-        self.keeper = LeaseKeeper(lease, self.ctl.clock)
+        env = kubectl.environment(request.environment)
+        locked = self._lock(env, bundle.app, request.holder, request.lease_seconds)
+        if locked:
+            return locked
+        assert self.keeper is not None
 
-        session = Session.open(self.ctl, self.request, self.run, kubectl, env, bundle, self.keeper)
+        session = Session.open(self.ctl, self.run, env, self.keeper, request, kubectl, bundle)
+        failed_recovery = session.recover()
+        if failed_recovery:
+            return failed_recovery
         rejected = session.validate_cluster()
         if rejected:
             return rejected
@@ -316,7 +369,9 @@ class Deploy:
         if unchanged:
             return unchanged
         session.prepare()
+        session.crash_point("after-prepare")
         session.deploy()
+        session.crash_point("after-deploy")
         verification = session.verify()
         if not verification.ok:
             return session.rollback(verification)
@@ -347,48 +402,53 @@ class Deploy:
             return Ending(Outcome.REJECTED, (violation,))
         return validation.bundle
 
-    def _lock(self, env: Environment, bundle: Bundle) -> HeldLease | Ending:
+
+class Recover(Invocation):
+    """deploysim recover: resolves an interrupted deployment without starting a new one."""
+
+    def __init__(self, controller: Controller, request: RecoverRequest) -> None:
+        super().__init__(controller, request.environment)
+        self.request = request
+        self.run.app = request.app
+
+    def _execute(self) -> Ending:
         request = self.request
-        now = self.ctl.clock()
-        try:
-            lease = acquire(env, bundle.app, request.holder, request.lease_seconds, now)
-        except Locked as exc:
-            expires = iso_millis(exc.expires_at) if exc.expires_at else None
-            detail: Detail = {"holder": exc.holder, "expires_at": expires}
-            self.run.record("LOCK", "acquire_lease", "LOCKED", detail=detail)
-            return Ending(Outcome.LOCKED, error=f"lease {exc}")
-        detail = {"holder": lease.holder, "took_over_from": lease.took_over_from}
-        self.run.record("LOCK", "acquire_lease", "OK", cmd=lease.cmd, detail=detail)
-        return lease
+        if request.environment not in ENVIRONMENTS:
+            allowed = ", ".join(ENVIRONMENTS)
+            violation = Violation("environment", "UNKNOWN", None, f"must be one of {allowed}")
+            return Ending(Outcome.REJECTED, (violation,))
+        env = Kubectl.connect(self.ctl.paths, self.ctl.kubeconfig).environment(request.environment)
+        locked = self._lock(env, request.app, request.holder, request.lease_seconds)
+        if locked:
+            return locked
+        assert self.keeper is not None
+
+        store, stored = Operator.load(self.run, env, request.app)
+        operator = Operator(self.ctl, self.run, env, request.app, self.keeper, store, stored)
+        if stored.state.in_flight is None:
+            self.run.record("RECOVER", "find_intent", "NO_OP", detail={"in_flight": None})
+            return Ending(Outcome.NO_OP)
+        failed_recovery = operator.recover()
+        return failed_recovery or Ending(Outcome.RECOVERED)
 
 
 @dataclass
-class Session:
-    """The stages that run while this run holds the Lease."""
+class Operator:
+    """Writes to one environment under the Lease, recording every step. Holds the stages
+    shared by deploy and recover: restoring a release, removing objects, recovery."""
 
     ctl: Controller
-    request: DeployRequest
     run: Run
-    kubectl: Kubectl
     env: Environment
-    bundle: Bundle
+    app: str
     keeper: LeaseKeeper
     store: StateStore
     stored: Stored
 
-    @classmethod
-    def open(
-        cls,
-        ctl: Controller,
-        request: DeployRequest,
-        run: Run,
-        kubectl: Kubectl,
-        env: Environment,
-        bundle: Bundle,
-        keeper: LeaseKeeper,
-    ) -> Session:
+    @staticmethod
+    def load(run: Run, env: Environment, app: str) -> tuple[StateStore, Stored]:
         """Loads the environment's state and records it."""
-        store = StateStore(env, bundle.app)
+        store = StateStore(env, app)
         stored = store.load()
         state = stored.state
         run.from_release = state.current.release if state.current else None
@@ -397,12 +457,196 @@ class Session:
         in_flight = state.in_flight.deployment_id if state.in_flight else None
         detail = {"status": state.status, "current": run.from_release, "in_flight": in_flight}
         run.record("VALIDATE", "load_state", "OK", cmd=stored.cmd, detail=detail)
-        return cls(ctl, request, run, kubectl, env, bundle, keeper, store, stored)
+        return store, stored
 
     def _save(self, stage: str, action: str, detail: Detail, **changes: Any) -> None:
         state = replace(self.stored.state, **changes)
         self.stored = self.store.save(self.stored, state, self.ctl.clock())
         self.run.record(stage, action, "OK", cmd=self.stored.cmd, detail=detail)
+
+    def _advance(self, stage: str) -> None:
+        in_flight = self.stored.state.in_flight
+        if in_flight:
+            advanced = replace(in_flight, stage=stage)
+            self._save(stage, "record_stage", {"stage": stage}, in_flight=advanced)
+
+    def _mark_release(
+        self,
+        stage: str,
+        release_name: str,
+        phase: str,
+        message: str,
+        attempt: int | None,
+        deployment_id: str | None,
+    ) -> None:
+        status = {
+            "phase": phase,
+            "attempts": attempt,
+            "deploymentId": deployment_id,
+            "message": message,
+            "lastTransitionTime": iso_millis(self.ctl.clock()),
+        }
+        result = self.env.patch_status(RELEASES, release_name, {"status": status})
+        detail = {"release": release_name, "phase": phase}
+        self.run.record(stage, "release_phase", "OK", cmd=result.cmd, detail=detail)
+
+    def _await_rollout(self, stage: str, names: list[str], timeout: float) -> Verification:
+        verification = verify(
+            self.env,
+            names,
+            timeout,
+            clock=self.ctl.clock,
+            sleep=self.ctl.sleep,
+            interval=self.ctl.poll_seconds,
+            on_poll=self.keeper.renew,
+        )
+        result = "OK" if verification.ok else "FAIL"
+        detail = verification.detail()
+        self.run.record(stage, "rollout_status", result, cmd=verification.cmd, detail=detail)
+        return verification
+
+    def _stored_objects(self, stage: str, ref: ReleaseRef) -> list[Manifest]:
+        """The objects stored for ref, or [] if PREPARE never stored them."""
+        name = stored_bundle_name(self.app, ref.version)
+        try:
+            stored = self.env.get("configmap", name)
+        except NotFound as exc:
+            missing: Detail = {"configmap": name}
+            self.run.record(stage, "load_bundle", "MISSING", cmd=exc.cmd, detail=missing)
+            return []
+        objects: list[Manifest] = json.loads(stored.json()["data"][BUNDLE_KEY])
+        detail = {"configmap": name, "objects": len(objects)}
+        self.run.record(stage, "load_bundle", "OK", cmd=stored.cmd, detail=detail)
+        return objects
+
+    def _reapply(self, stage: str, ref: ReleaseRef, fault: str | None) -> tuple[list[str], int]:
+        """Applies ref's stored objects; returns its Deployments and health check timeout."""
+        objects = self._stored_objects(stage, ref)
+        release_spec = self.env.get(RELEASES, ref.release).json()["spec"]
+        manifests = workload_manifests(objects, self.app, fault)
+        result = self.env.apply(manifests)
+        detail = {
+            "to": ref.release,
+            "objects": [describe_object(m) for m in manifests],
+            "injected_fault": fault,
+        }
+        self.run.record(stage, "apply", "OK", cmd=result.cmd, detail=detail)
+        return deployment_names(objects), int(release_spec["healthCheck"]["timeoutSeconds"])
+
+    def _remove(self, stage: str, objects: list[Manifest]) -> None:
+        for manifest in workload_manifests(objects, self.app):
+            kind, name = manifest["kind"], manifest["metadata"]["name"]
+            result = self.env.delete(kind, name, wait=True)
+            removed: Detail = {"object": f"{kind}/{name}"}
+            self.run.record(stage, "delete", "OK", cmd=result.cmd, detail=removed)
+
+    def _finish(self, stage: str, status: Status, current: ReleaseRef | None, outcome: str) -> None:
+        """Clears in_flight and records the interrupted or rolled-back attempt's outcome."""
+        in_flight = self.stored.state.in_flight
+        if in_flight is None:
+            raise RuntimeError(f"{stage} without an intent record")
+        last = LastOutcome(in_flight.deployment_id, in_flight.attempt, outcome)
+        detail = {"current": current.release if current else None, "status": status}
+        self._save(
+            stage,
+            "record_outcome",
+            detail,
+            status=status,
+            current=current,
+            in_flight=None,
+            last_outcome=last,
+        )
+        self.run.environment_status = status
+        self.run.final_release = current.release if current else None
+
+    # RECOVER --------------------------------------------------------------------------------
+
+    def recover(self) -> Ending | None:
+        """A leftover intent record means its run died. Restores that record's previous
+        release, or removes the target's objects if there was none, and marks the
+        interrupted Release Interrupted. Returns an Ending only if the restore failed."""
+        in_flight = self.stored.state.in_flight
+        if in_flight is None:
+            return None
+        target, previous = in_flight.target, in_flight.previous
+        detail = {
+            "interrupted": in_flight.deployment_id,
+            "attempt": in_flight.attempt,
+            "stage": in_flight.stage,
+            "target": target.release,
+            "previous": previous.release if previous else None,
+        }
+        self.run.record("RECOVER", "find_intent", "FOUND", detail=detail)
+
+        if previous is None:
+            self._remove("RECOVER", self._stored_objects("RECOVER", target))
+            ok, status, reason = True, Status.EMPTY, "Complete"
+        else:
+            names, timeout = self._reapply("RECOVER", previous, None)
+            check = self._await_rollout("RECOVER", names, timeout)
+            ok, reason = check.ok, check.reason
+            status = Status.HEALTHY if ok else Status.DEGRADED
+        self._finish("RECOVER", status, previous, "INTERRUPTED")
+
+        restored = previous.release if previous else "nothing"
+        message = f"interrupted at {in_flight.stage}; restored {restored}"
+        try:
+            self._mark_release(
+                "RECOVER",
+                target.release,
+                "Interrupted",
+                message,
+                in_flight.attempt,
+                in_flight.deployment_id,
+            )
+        except NotFound as exc:
+            self.run.record("RECOVER", "release_phase", "MISSING", cmd=exc.cmd)
+        self.run.recovery = {
+            "performed": True,
+            "interrupted": in_flight.deployment_id,
+            "to": previous.release if previous else None,
+            "result": "SUCCEEDED" if ok else "FAILED",
+        }
+        if ok:
+            return None
+        error = f"recovery to {restored} failed: {reason}"
+        return Ending(Outcome.ROLLBACK_FAILED, error=error)
+
+
+@dataclass
+class Session(Operator):
+    """The deploy stages that run while this run holds the Lease."""
+
+    request: DeployRequest
+    kubectl: Kubectl
+    bundle: Bundle
+
+    @classmethod
+    def open(
+        cls,
+        ctl: Controller,
+        run: Run,
+        env: Environment,
+        keeper: LeaseKeeper,
+        request: DeployRequest,
+        kubectl: Kubectl,
+        bundle: Bundle,
+    ) -> Session:
+        store, stored = Operator.load(run, env, bundle.app)
+        return cls(ctl, run, env, bundle.app, keeper, store, stored, request, kubectl, bundle)
+
+    def crash_point(self, point: str) -> None:
+        """--inject-fault crash-<point>: exit at once, leaving the Lease and intent record."""
+        fault = f"crash-{point}"
+        if self.request.inject_fault != fault:
+            return
+        self.run.record(self.run.stage, "inject_crash", "CRASH", detail={"fault": fault})
+        self.run.progress.flush()
+        os._exit(ExitCode.SIMULATED_CRASH)
+
+    def _phase(self, stage: str, phase: str, message: str) -> None:
+        run = self.run
+        self._mark_release(stage, self.bundle.name, phase, message, run.attempt, run.deployment_id)
 
     # VALIDATE (cluster) ---------------------------------------------------------------------
 
@@ -570,18 +814,7 @@ class Session:
         result = self.env.apply([release_manifest(bundle)])
         release_detail = {"release": bundle.name}
         run.record("PREPARE", "record_release", "OK", cmd=result.cmd, detail=release_detail)
-        self._release_phase("PREPARE", "Deploying", "applying the bundle")
-
-    def _release_phase(self, stage: str, phase: str, message: str) -> None:
-        status = {
-            "phase": phase,
-            "attempts": self.run.attempt,
-            "deploymentId": self.run.deployment_id,
-            "message": message,
-            "lastTransitionTime": iso_millis(self.ctl.clock()),
-        }
-        result = self.env.patch_status(RELEASES, self.bundle.name, {"status": status})
-        self.run.record(stage, "release_phase", "OK", cmd=result.cmd, detail={"phase": phase})
+        self._phase("PREPARE", "Deploying", "applying the bundle")
 
     # DEPLOY ---------------------------------------------------------------------------------
 
@@ -593,34 +826,13 @@ class Session:
         self.run.record("DEPLOY", "apply", "OK", cmd=result.cmd, detail=detail)
         self._advance("DEPLOY")
 
-    def _advance(self, stage: str) -> None:
-        in_flight = self.stored.state.in_flight
-        if in_flight:
-            advanced = replace(in_flight, stage=stage)
-            self._save(stage, "record_stage", {"stage": stage}, in_flight=advanced)
-
     # VERIFY ---------------------------------------------------------------------------------
 
     def verify(self) -> Verification:
         self.run.final_release = self.bundle.name
-        self._release_phase("VERIFY", "Verifying", "waiting for the rollout")
+        self._phase("VERIFY", "Verifying", "waiting for the rollout")
         names = deployment_names(self.bundle.objects)
         return self._await_rollout("VERIFY", names, self.bundle.timeout_seconds)
-
-    def _await_rollout(self, stage: str, names: list[str], timeout: float) -> Verification:
-        verification = verify(
-            self.env,
-            names,
-            timeout,
-            clock=self.ctl.clock,
-            sleep=self.ctl.sleep,
-            interval=self.ctl.poll_seconds,
-            on_poll=self.keeper.renew,
-        )
-        result = "OK" if verification.ok else "FAIL"
-        detail = verification.detail()
-        self.run.record(stage, "rollout_status", result, cmd=verification.cmd, detail=detail)
-        return verification
 
     # ROLLBACK -------------------------------------------------------------------------------
 
@@ -633,71 +845,32 @@ class Session:
         reason = f"health check failed: {failed.reason}"
         previous = in_flight.previous
         if previous is None:
-            for manifest in workload_manifests(self.bundle.objects, self.bundle.app):
-                kind, name = manifest["kind"], manifest["metadata"]["name"]
-                result = self.env.delete(kind, name, wait=True)
-                removed: Detail = {"object": f"{kind}/{name}"}
-                self.run.record("ROLLBACK", "delete", "OK", cmd=result.cmd, detail=removed)
-            message = "nothing to restore; objects removed"
-            self._conclude(Status.EMPTY, None, Outcome.ROLLED_BACK, message)
+            self._remove("ROLLBACK", list(self.bundle.objects))
+            self.crash_point("during-rollback")
+            self._conclude(Status.EMPTY, None, Outcome.ROLLED_BACK, "nothing to restore; removed")
             return Ending(Outcome.ROLLED_BACK, error=f"{reason}; first deployment removed")
 
-        objects, timeout = self._load_bundle(previous)
-        fault = self.request.rollback_fault
-        manifests = workload_manifests(objects, self.bundle.app, fault)
-        result = self.env.apply(manifests)
-        detail = {
-            "to": previous.release,
-            "objects": [describe_object(m) for m in manifests],
-            "injected_fault": fault,
-        }
-        self.run.record("ROLLBACK", "apply", "OK", cmd=result.cmd, detail=detail)
-        restored = self._await_rollout("ROLLBACK", deployment_names(objects), timeout)
+        names, timeout = self._reapply("ROLLBACK", previous, self.request.rollback_fault)
+        self.crash_point("during-rollback")
+        restored = self._await_rollout("ROLLBACK", names, timeout)
         if restored.ok:
             message = f"rolled back to {previous.release}"
             self._conclude(Status.HEALTHY, previous, Outcome.ROLLED_BACK, message)
-            return Ending(Outcome.ROLLED_BACK, error=f"{reason}; rolled back to {previous.release}")
+            return Ending(Outcome.ROLLED_BACK, error=f"{reason}; {message}")
         message = f"rollback to {previous.release} failed: {restored.reason}"
         self._conclude(Status.DEGRADED, previous, Outcome.ROLLBACK_FAILED, message)
         return Ending(Outcome.ROLLBACK_FAILED, error=f"{reason}; {message}")
 
-    def _load_bundle(self, ref: ReleaseRef) -> tuple[list[Manifest], int]:
-        """The stored objects of an earlier release and its health check timeout."""
-        name = stored_bundle_name(self.bundle.app, ref.version)
-        stored = self.env.get("configmap", name)
-        objects: list[Manifest] = json.loads(stored.json()["data"][BUNDLE_KEY])
-        release = self.env.get(RELEASES, ref.release).json()
-        timeout = int(release["spec"]["healthCheck"]["timeoutSeconds"])
-        detail = {"configmap": name, "objects": len(objects), "timeout_s": timeout}
-        self.run.record("ROLLBACK", "load_bundle", "OK", cmd=stored.cmd, detail=detail)
-        return objects, timeout
-
     def _conclude(
         self, status: Status, current: ReleaseRef | None, outcome: Outcome, message: str
     ) -> None:
-        in_flight = self.stored.state.in_flight
-        if in_flight is None:
-            raise RuntimeError("ROLLBACK without an intent record")
-        result = "SUCCEEDED" if outcome == Outcome.ROLLED_BACK else "FAILED"
-        last = LastOutcome(in_flight.deployment_id, in_flight.attempt, outcome)
-        detail = {"current": current.release if current else None, "status": status}
-        self._save(
-            "ROLLBACK",
-            "record_outcome",
-            detail,
-            status=status,
-            current=current,
-            in_flight=None,
-            last_outcome=last,
-        )
+        self._finish("ROLLBACK", status, current, outcome)
         phase = "RolledBack" if outcome == Outcome.ROLLED_BACK else "RollbackFailed"
-        self._release_phase("ROLLBACK", phase, message)
-        self.run.environment_status = status
-        self.run.final_release = current.release if current else None
+        self._phase("ROLLBACK", phase, message)
         self.run.rollback = {
             "performed": True,
             "to": current.release if current else None,
-            "result": result,
+            "result": "SUCCEEDED" if outcome == Outcome.ROLLED_BACK else "FAILED",
         }
 
     # COMPLETE -------------------------------------------------------------------------------
@@ -721,4 +894,4 @@ class Session:
             in_flight=None,
             last_outcome=outcome,
         )
-        self._release_phase("COMPLETE", "Succeeded", "rollout complete")
+        self._phase("COMPLETE", "Succeeded", "rollout complete")

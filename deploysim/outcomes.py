@@ -13,11 +13,13 @@ class ExitCode(IntEnum):
     LOCKED = 4
     ENVIRONMENT_ERROR = 5
     USAGE = 64
+    SIMULATED_CRASH = 70
 
 
 class Outcome(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     NO_OP = "NO_OP"
+    RECOVERED = "RECOVERED"
     REJECTED = "REJECTED"
     ROLLED_BACK = "ROLLED_BACK"
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
@@ -32,6 +34,7 @@ class Outcome(StrEnum):
 _EXIT_CODES = {
     Outcome.SUCCEEDED: ExitCode.SUCCESS,
     Outcome.NO_OP: ExitCode.SUCCESS,
+    Outcome.RECOVERED: ExitCode.SUCCESS,
     Outcome.REJECTED: ExitCode.REJECTED,
     Outcome.ROLLED_BACK: ExitCode.ROLLED_BACK,
     Outcome.ROLLBACK_FAILED: ExitCode.ROLLBACK_FAILED,

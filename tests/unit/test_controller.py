@@ -59,6 +59,7 @@ def test_in_cluster_manifests_carry_labels_and_digest() -> None:
 def test_outcome_exit_codes() -> None:
     assert Outcome.SUCCEEDED.exit_code == ExitCode.SUCCESS
     assert Outcome.NO_OP.exit_code == ExitCode.SUCCESS
+    assert Outcome.RECOVERED.exit_code == ExitCode.SUCCESS
     assert Outcome.REJECTED.exit_code == ExitCode.REJECTED
     assert Outcome.ROLLED_BACK.exit_code == ExitCode.ROLLED_BACK
     assert Outcome.ROLLBACK_FAILED.exit_code == ExitCode.ROLLBACK_FAILED
@@ -87,3 +88,13 @@ def test_fault_targets() -> None:
     assert (plain.target_fault, plain.rollback_fault) == (None, None)
     assert (target.target_fault, target.rollback_fault) == ("unhealthy", None)
     assert (both.target_fault, both.rollback_fault) == ("unhealthy", "unhealthy")
+
+
+def test_crash_faults() -> None:
+    during_rollback = DeployRequest(EXAMPLE, "dev", inject_fault="crash-during-rollback")
+    after_deploy = DeployRequest(EXAMPLE, "dev", inject_fault="crash-after-deploy")
+
+    assert during_rollback.target_fault == "unhealthy"
+    assert during_rollback.rollback_fault is None
+    assert (after_deploy.target_fault, after_deploy.rollback_fault) == (None, None)
+    assert int(ExitCode.SIMULATED_CRASH) == 70
