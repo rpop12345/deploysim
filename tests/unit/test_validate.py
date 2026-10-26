@@ -13,6 +13,7 @@ import yaml
 
 from deploysim.audit import AuditLog
 from deploysim.bundle import Bundle, parse_documents
+from deploysim.errors import ToolError
 from deploysim.paths import Paths
 from deploysim.validate import validate_file
 
@@ -186,7 +187,8 @@ def test_cli_rejected(tmp_path: Path) -> None:
     assert record.detail["violations"] == ["bundle:READINESS_PROBE"]
 
 
-def test_tool_missing(tmp_path: Path) -> None:
+def test_tool_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
     audit_path = tmp_path / "audit.jsonl"
 
     result = run_cli("validate", str(EXAMPLE), "--audit-log", str(audit_path), root=tmp_path)
@@ -196,3 +198,13 @@ def test_tool_missing(tmp_path: Path) -> None:
     assert "run make tools" in result.stderr
     [record] = AuditLog(audit_path).records()
     assert record.result == "ERROR"
+
+
+def test_tool_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def hang(cmd: tuple[str, ...], **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", hang)
+
+    with pytest.raises(ToolError, match="kubectl-validate timed out after 60 s"):
+        validate_file(EXAMPLE, PATHS)

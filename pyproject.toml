@@ -29,8 +29,23 @@ deploysim = "deploysim.cli:main"
 [tool.setuptools.dynamic]
 version = { attr = "deploysim.__version__" }
 
-[tool.setuptools.packages.find]
-include = ["deploysim*"]
+# The validation schemas and the Release CRD ship inside the wheel, so it runs without a checkout.
+[tool.setuptools]
+packages = [
+  "deploysim",
+  "deploysim.crds",
+  "deploysim.schemas.api",
+  "deploysim.schemas.apis.apps",
+]
+
+[tool.setuptools.package-dir]
+"deploysim.crds" = "crds"
+"deploysim.schemas" = "schemas"
+
+[tool.setuptools.package-data]
+"deploysim.crds" = ["*.yaml"]
+"deploysim.schemas.api" = ["*.json"]
+"deploysim.schemas.apis.apps" = ["*.json"]
 
 [tool.ruff]
 line-length = 100

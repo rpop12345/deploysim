@@ -55,7 +55,7 @@ def rollout_status(deployment: Manifest) -> RolloutStatus:
 
 @dataclass(frozen=True)
 class Verification:
-    """reason: Complete, ProgressDeadlineExceeded or Timeout."""
+    """reason: Complete, ProgressDeadlineExceeded, Timeout or NoDeployments."""
 
     ok: bool
     reason: str
@@ -85,6 +85,8 @@ def verify(
 ) -> Verification:
     """Polls until every Deployment is complete, one fails, or timeout_seconds pass.
     on_poll runs after every poll; the controller renews the Lease there."""
+    if not deployments:
+        return Verification(False, "NoDeployments", (), 0.0, 0, None)
     started = clock()
     polls = 0
     while True:

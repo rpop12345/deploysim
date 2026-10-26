@@ -24,6 +24,7 @@ from deploysim.errors import ToolError
 from deploysim.paths import Paths
 
 _SKIPPED_RULES_NOTICE = "some validation rules were not checked"
+TIMEOUT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -69,7 +70,8 @@ def run_kubectl_validate(
     """Runs with KUBECONFIG=/dev/null: it never contacts a cluster or runs a credential plugin."""
     for required in (paths.kubectl_validate, paths.schemas, paths.crds):
         if not required.exists():
-            raise ToolError(f"{required} not found; run make tools, or set DEPLOYSIM_ROOT")
+            hint = "run make tools, add the tools to PATH, or set DEPLOYSIM_ROOT"
+            raise ToolError(f"{required} not found; {hint}")
     cmd = (
         str(paths.kubectl_validate),
         str(path),
@@ -81,7 +83,12 @@ def run_kubectl_validate(
         "json",
     )
     env = {**os.environ, "KUBECONFIG": os.devnull}
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=60)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, env=env, check=False, timeout=TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError(f"kubectl-validate timed out after {TIMEOUT_SECONDS} s") from exc
     try:
         report: dict[str, list[dict[str, Any]]] = json.loads(result.stdout)
     except json.JSONDecodeError as exc:

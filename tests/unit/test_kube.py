@@ -172,3 +172,18 @@ def test_only_kube_and_validate_spawn_processes() -> None:
     }
 
     assert spawning == {"kube.py", "validate.py"}
+
+
+def test_run_timeout_is_unreachable(
+    tmp_path: Path, fake_kubectl: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kubeconfig = write_kubeconfig(tmp_path / "config", "https://127.0.0.1:1")
+
+    def hang(cmd: tuple[str, ...], **kwargs: Any) -> None:
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", hang)
+
+    with pytest.raises(Unreachable, match="kubectl timed out after 120 s") as raised:
+        Kubectl(fake_kubectl, kubeconfig).run("get", "ns")
+    assert raised.value.cmd[-2:] == ("get", "ns")

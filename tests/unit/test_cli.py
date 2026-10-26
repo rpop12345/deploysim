@@ -11,6 +11,7 @@ import pytest
 import yaml
 
 from deploysim.audit import AuditLog, Entry
+from deploysim.cli import main
 
 REPO = Path(__file__).resolve().parents[2]
 README = (REPO / "README.md").read_text()
@@ -35,11 +36,11 @@ def readme_json(heading: str) -> dict[str, Any]:
     return loaded
 
 
-def remote_kubeconfig(path: Path) -> Path:
+def remote_kubeconfig(path: Path, server: str = "https://prod.example.com:6443") -> Path:
     config = {
         "apiVersion": "v1",
         "kind": "Config",
-        "clusters": [{"name": "prod", "cluster": {"server": "https://prod.example.com:6443"}}],
+        "clusters": [{"name": "prod", "cluster": {"server": server}}],
         "users": [{"name": "admin", "user": {}}],
         "contexts": [{"name": "prod", "context": {"cluster": "prod", "user": "admin"}}],
         "current-context": "prod",
@@ -153,3 +154,28 @@ def test_unwritable_audit_log_exit_5(tmp_path: Path) -> None:
     assert "audit log" in result.stderr
     assert "cannot write" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_kubectl_timeout_exit_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real_run = subprocess.run
+
+    def kubectl_hangs(cmd: tuple[str, ...], **kwargs: Any) -> Any:
+        if Path(cmd[0]).name == "kubectl":
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", kubectl_hangs)
+    monkeypatch.setenv("DEPLOYSIM_ROOT", str(REPO))
+    kubeconfig = remote_kubeconfig(tmp_path / "kubeconfig", "https://127.0.0.1:1")
+    audit = tmp_path / "audit.jsonl"
+    args = ["--env", "dev", "--kubeconfig", str(kubeconfig), "--audit-log", str(audit)]
+
+    code = main(["deploy", str(EXAMPLE), *args])
+
+    assert code == 5
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["outcome"] == "ENVIRONMENT_ERROR"
+    assert summary["error"] == "kubectl timed out after 120 s"
+    assert AuditLog(audit).records()[-1].result == "ERROR"

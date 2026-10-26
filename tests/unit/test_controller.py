@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import io
 from dataclasses import replace
 from pathlib import Path
 
+from deploysim.audit import AuditLog
 from deploysim.bundle import Bundle, parse_documents
 from deploysim.controller import (
+    Controller,
     DeployRequest,
+    Ending,
+    Invocation,
+    LeaseKeeper,
+    Run,
     bundle_configmap,
     deployment_id,
     release_manifest,
     workload_manifests,
 )
 from deploysim.outcomes import ExitCode, Outcome
+from deploysim.paths import Paths
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "orders-api-1.1.0.yaml"
 
@@ -98,3 +106,34 @@ def test_crash_faults() -> None:
     assert during_rollback.rollback_fault is None
     assert (after_deploy.target_fault, after_deploy.rollback_fault) == (None, None)
     assert int(ExitCode.SIMULATED_CRASH) == 70
+
+
+class SpyKeeper(LeaseKeeper):
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self, run: Run) -> None:
+        self.released = True
+
+
+class Failing(Invocation):
+    """A bug, not an environment problem, while the Lease is held."""
+
+    def _execute(self) -> Ending:
+        raise KeyError("status")
+
+
+def test_unexpected_error_exits_5_and_releases_lease(tmp_path: Path) -> None:
+    progress = io.StringIO()
+    controller = Controller(Paths(tmp_path), AuditLog(tmp_path / "audit.jsonl"), progress=progress)
+    invocation = Failing(controller, "dev")
+    keeper = SpyKeeper()
+    invocation.keeper = keeper
+
+    report = invocation.execute()
+
+    assert report.outcome.exit_code == ExitCode.ENVIRONMENT_ERROR
+    assert report.summary["error"] == "unexpected KeyError: 'status'"
+    assert [step["result"] for step in report.summary["steps"]] == ["ERROR"]
+    assert keeper.released
+    assert "Traceback" in progress.getvalue()

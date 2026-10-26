@@ -181,3 +181,45 @@ def test_recover_noop(kubectl: Kubectl, app: str, tmp_path: Path, deploy: Deploy
     assert result.summary["recovery"]["performed"] is False
     after = kubectl.get("configmap", configmap, "-n", "dev")["metadata"]["resourceVersion"]
     assert after == before
+
+
+def test_recover_removes_added_objects(
+    kubectl: Kubectl, app: str, tmp_path: Path, deploy: Deploy
+) -> None:
+    deploy(write_bundle(tmp_path, app, "1.0.0", **FAST), "dev")
+    upgrade = write_bundle(tmp_path, app, "1.1.0", worker=True, **FAST)
+    deploy(upgrade, "dev", "--inject-fault", "crash-after-deploy", "--lease-seconds", LEASE)
+    assert f"Deployment/{app}-worker" in labelled(kubectl, "deployments", app, "dev")
+    wait_for_lease_expiry()
+
+    result = deploysim("recover", "--app", app, "--env", "dev", audit_log=tmp_path / "r.jsonl")
+
+    assert result.code == 0, result.stderr
+    assert result.summary["environment_status"] == "HEALTHY"
+    remaining = labelled(kubectl, "deployments,services", app, "dev")
+    assert remaining == [f"Deployment/{app}", f"Service/{app}"]
+
+
+def test_recover_without_stored_bundle(
+    kubectl: Kubectl, app: str, tmp_path: Path, deploy: Deploy
+) -> None:
+    deploy(write_bundle(tmp_path, app, "1.0.0", **FAST), "dev")
+    upgrade = write_bundle(tmp_path, app, "1.1.0", **FAST)
+    deploy(upgrade, "dev", "--inject-fault", "crash-after-deploy", "--lease-seconds", LEASE)
+    kubectl.run("delete", "configmap", f"deploysim-{app}-1.0.0", "-n", "dev")
+    wait_for_lease_expiry()
+    audit = tmp_path / "recover.jsonl"
+
+    failed = deploysim("recover", "--app", app, "--env", "dev", audit_log=audit)
+    again = deploysim("recover", "--app", app, "--env", "dev", audit_log=audit)
+
+    assert failed.code == 3, failed.stderr
+    assert failed.summary["outcome"] == "ROLLBACK_FAILED"
+    assert failed.summary["recovery"]["result"] == "FAILED"
+    assert f"ConfigMap deploysim-{app}-1.0.0 is missing" in failed.summary["error"]
+    state = state_of(kubectl, app, "dev")
+    assert (state["status"], state["in_flight"]) == ("DEGRADED", None)
+    assert state["current"]["release"] == f"{app}-1.1.0"
+    assert phase(kubectl, app, "1.1.0") == "Interrupted"
+    assert again.code == 0, again.stderr
+    assert again.summary["outcome"] == "NO_OP"

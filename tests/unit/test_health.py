@@ -124,3 +124,19 @@ def test_verify_times_out() -> None:
 
     assert (result.ok, result.reason, result.polls) == (False, "Timeout", 4)
     assert result.detail()["deployments"][0]["message"] == "0 of 3 replicas available"
+
+
+def test_verify_nothing_is_not_complete() -> None:
+    cluster = FakeCluster([])
+
+    result = verify(
+        cluster,
+        [],
+        30,
+        clock=cluster.clock,
+        sleep=cluster.sleep,
+        interval=1,
+        on_poll=cluster.on_poll,
+    )
+
+    assert (result.ok, result.reason, result.polls) == (False, "NoDeployments", 0)

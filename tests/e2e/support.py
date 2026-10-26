@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -148,8 +149,10 @@ def bundle_documents(
     progress_deadline: int = 10,
     timeout: int = 20,
     readiness: bool = True,
+    worker: bool = False,
 ) -> list[Manifest]:
-    """A release bundle that passes validation unless readiness=False."""
+    """A release bundle that passes validation unless readiness=False. worker adds a second
+    Deployment, <app>-worker."""
     image_ref = image(app, image_seed or version)
     release_doc = release(app, version, image_ref)
     release_doc["spec"]["healthCheck"] = {"timeoutSeconds": timeout}
@@ -167,7 +170,15 @@ def bundle_documents(
         "metadata": {"name": app, "labels": {NAME_LABEL: app}},
         "spec": {"selector": {NAME_LABEL: app}, "ports": [{"port": 80, "targetPort": 8080}]},
     }
-    return [release_doc, workload, service]
+    documents = [release_doc, workload, service]
+    if worker:
+        extra = copy.deepcopy(workload)
+        extra["metadata"]["name"] = f"{app}-worker"
+        component = {"app.kubernetes.io/component": "worker"}
+        extra["spec"]["selector"]["matchLabels"].update(component)
+        extra["spec"]["template"]["metadata"]["labels"].update(component)
+        documents.append(extra)
+    return documents
 
 
 def write_bundle(directory: Path, app: str, version: str = "1.0.0", **options: Any) -> Path:

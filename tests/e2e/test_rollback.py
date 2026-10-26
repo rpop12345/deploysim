@@ -227,3 +227,51 @@ def test_degraded_gate(kubectl: Kubectl, failed_rollback: Scenario) -> None:
     assert_settled(state)
     assert (state["status"], state["current"]["release"]) == ("HEALTHY", f"{app}-1.1.0")
     assert state["last_outcome"]["outcome"] == "SUCCEEDED"
+
+
+def test_rollback_removes_added_objects(
+    kubectl: Kubectl, app: str, tmp_path: Path, deploy: Deploy
+) -> None:
+    deploy(write_bundle(tmp_path, app, "1.0.0", **FAST), "dev")
+    upgrade = write_bundle(tmp_path, app, "1.1.0", worker=True, **FAST)
+
+    result = deploy(upgrade, "dev", "--inject-fault", "unhealthy")
+
+    assert result.code == 2, result.stderr
+    assert result.summary["environment_status"] == "HEALTHY"
+    deleted = [
+        step["detail"]["object"]
+        for step in result.summary["steps"]
+        if (step["stage"], step["action"]) == ("ROLLBACK", "delete")
+    ]
+    assert deleted == [f"Deployment/{app}-worker"]
+    remaining = labelled(kubectl, "deployments,services", app, "dev")
+    assert remaining == [f"Deployment/{app}", f"Service/{app}"]
+
+
+def test_rollback_without_stored_bundle(
+    kubectl: Kubectl, app: str, tmp_path: Path, deploy: Deploy
+) -> None:
+    first = write_bundle(tmp_path, app, "1.0.0", **FAST)
+    deploy(first, "dev")
+    kubectl.run("delete", "configmap", f"deploysim-{app}-1.0.0", "-n", "dev")
+    upgrade = write_bundle(tmp_path, app, "1.1.0", **FAST)
+
+    failed = deploy(upgrade, "dev", "--inject-fault", "unhealthy")
+    degraded = state_of(kubectl, app, "dev")
+    redeployed = deploy(first, "dev", "--allow-degraded")
+
+    assert failed.code == 3, failed.stderr
+    summary = failed.summary
+    assert summary["outcome"] == "ROLLBACK_FAILED"
+    assert summary["rollback"] == {"performed": True, "to": f"{app}-1.0.0", "result": "FAILED"}
+    assert (summary["final"], summary["environment_status"]) == (f"{app}-1.1.0", "DEGRADED")
+    assert f"ConfigMap deploysim-{app}-1.0.0 is missing" in summary["error"]
+    assert phase(kubectl, app, "1.1.0") == "RollbackFailed"
+    assert_settled(degraded)
+    assert (degraded["status"], degraded["current"]["release"]) == ("DEGRADED", f"{app}-1.1.0")
+    assert degraded["last_known_good"]["release"] == f"{app}-1.0.0"
+    assert redeployed.code == 0, redeployed.stderr
+    state = state_of(kubectl, app, "dev")
+    assert (state["status"], state["current"]["release"]) == ("HEALTHY", f"{app}-1.0.0")
+    assert kubectl.get("configmap", f"deploysim-{app}-1.0.0", "-n", "dev")["immutable"] is True
