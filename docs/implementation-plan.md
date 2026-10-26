@@ -15,7 +15,7 @@ with `make lint test` green.
 
 ## Rules for every phase
 
-These are checked again at the end of each phase. They have been met for P0 to P6.
+These are checked again at the end of each phase. They have been met for P0 to P7.
 
 - All tests from earlier phases still pass.
 - `ruff check`, `ruff format --check`, `mypy --strict` and `shellcheck` are clean.
@@ -32,8 +32,8 @@ These are checked again at the end of each phase. They have been met for P0 to P
 | P3 Bundle loading and offline validation | ✅ Done | `829f0d2` (PR #3, merged as `6b23ac2`) |
 | P4 Kubernetes access layer | ✅ Done | `5794c9c` (PR #4, merged as `87f48ea`) |
 | P5 Deploy, happy path | ✅ Done | `8bcc598` (PR #5, merged as `7ee0de2`) |
-| P6 Rollback and degraded environments | ✅ Done | not yet committed |
-| P7 Idempotency, drift and retries | ⬜ Not started | |
+| P6 Rollback and degraded environments | ✅ Done | `e4a0f66` (PR #6, merged as `bad0cf1`) |
+| P7 Idempotency, drift and retries | ✅ Done | not yet committed |
 | P8 Crash recovery | ⬜ Not started | |
 | P9 CLI completeness and demo | ⬜ Not started | |
 | P10 CI complete | ⬜ Not started | |
@@ -477,28 +477,41 @@ true after P6: exit 2, a `FAIL` VERIFY record, and `current` unchanged.
 
 ## P7: Idempotency, drift and retries
 
+**Status:** ✅ Done
+
 **Goal:** re-running any deploy is safe, and converges on the desired state.
 
 **Deliverables**
-- The desired-state check: target is current, `kubectl diff` exits 0, and the rollout is healthy,
-  giving `NO_OP`.
-- Drift: when the target is current but differs or is unhealthy, re-apply and verify, and set
-  `drift_corrected: true`.
-- Attempt N+1 on retry after a rollback; the `downgrade` flag.
+- `Session.desired_state()`, run after pass 2 and before `PREPARE`, records one `desired_state`
+  step:
+  - `DEPLOY` when the target is not current, an intent record exists, or the status is not
+    `HEALTHY`;
+  - `NO_OP` (exit 0) when the target is current, `Environment.drift()` reports nothing, and
+    every Deployment's rollout is complete;
+  - `DRIFT` when the target is current but drifted or is unhealthy. It then redeploys as the next
+    attempt, with `drift_corrected: true` in the summary.
+- `attempt` is assigned at `PREPARE` (`attempts[deployment_id] + 1`), so `REJECTED`, `LOCKED` and
+  `NO_OP` report `attempt: null`.
+- `record_intent` carries `downgrade`, comparing versions by semantic-version precedence
+  (`bundle.version_key`).
 
 **Definition of done**
-- [ ] A `NO_OP` run performs no write call. The audit records show only reads.
-- [ ] All P7 tests pass.
+- [x] A `NO_OP` run performs no write. Its steps contain none of the write actions, and the state
+      ConfigMap, Release, Deployment generation and ReplicaSets are unchanged. Only the Lease's
+      holder and renew time change, because the check runs under the lock.
+- [x] All P7 tests pass (88 unit, 48 e2e; three consecutive green `make test` runs; e2e about
+      2 min). `test_concurrent_deploys` also passed 8 of 8 standalone runs.
 
 **Tests that must pass** (`tests/e2e/test_idempotency.py`)
 
-| Test | Asserts |
-|---|---|
-| `test_repeat_is_noop` | Second identical deploy gives exit 0 and `NO_OP`; Deployment `generation` and ReplicaSet set unchanged |
-| `test_drift_corrected` | After `kubectl scale --replicas=1`, deploy gives exit 0 with `drift_corrected: true` and replicas restored |
-| `test_retry_after_rollback` | `unhealthy` then the same release without the fault gives exit 0 and attempt 2, in both the summary and the Release status |
-| `test_concurrent_deploys` | Two deploys started together: exactly one exit 0 and one exit 4; final state consistent |
-| `test_downgrade_flagged` | 1.1.0 then 1.0.0 gives exit 0, and the audit records `downgrade: true` |
+| Test | Asserts | Status |
+|---|---|---|
+| `test_repeat_is_noop` | Second identical deploy: exit 0, `NO_OP`, `attempt: null`, no write step; the state and Release resourceVersions, Deployment generation and ReplicaSet set are unchanged; attempts still 1 | ✅ |
+| `test_drift_corrected` | After `kubectl scale --replicas=1`: exit 0, `SUCCEEDED`, `drift_corrected: true`, attempt 2, `desired_state` lists `Deployment/<app>`; replicas restored to 2 | ✅ |
+| `test_retry_after_rollback` | `unhealthy`, then the same release without the fault: same deployment ID, attempts 1 then 2; Release `Succeeded` with attempts 2 | ✅ |
+| `test_concurrent_deploys` | Two deploys started together: exit codes `[0, 4]`; the loser is `LOCKED`; state `HEALTHY` on the winner's release, no `in_flight`, Lease released, audit chain intact | ✅ |
+| `test_downgrade_flagged` | 1.0.0, then 1.1.0, then 1.0.0: `downgrade` is `[False, False, True]` | ✅ |
+| `tests/unit/test_bundle.py::test_version_ordering` | The Semantic Versioning specification's precedence example, then later releases, sort correctly | ✅ |
 
 ---
 

@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import IO, Any
 
 from deploysim.audit import AuditLog, Entry
-from deploysim.bundle import Bundle, Violation, canonical_json
+from deploysim.bundle import Bundle, Violation, canonical_json, version_key
 from deploysim.clock import iso_millis, utcnow
 from deploysim.errors import EnvironmentProblem
-from deploysim.health import Verification, verify
+from deploysim.health import Verification, rollout_status, verify
 from deploysim.kube import (
     AlreadyExists,
     Conflict,
@@ -170,6 +170,7 @@ class Run:
         self.final_release: str | None = None
         self.environment_status: Status | None = None
         self.rollback: Detail = {"performed": False, "to": None, "result": None}
+        self.drift_corrected = False
         self.steps: list[Detail] = []
 
     def record(
@@ -210,6 +211,7 @@ class Run:
             "to": self.to_release,
             "outcome": ending.outcome.value,
             "rollback": self.rollback,
+            "drift_corrected": self.drift_corrected,
             "final": self.final_release,
             "environment_status": self.environment_status,
             "started_at": iso_millis(self.started),
@@ -310,6 +312,9 @@ class Deploy:
         rejected = session.validate_cluster()
         if rejected:
             return rejected
+        unchanged = session.desired_state()
+        if unchanged:
+            return unchanged
         session.prepare()
         session.deploy()
         verification = session.verify()
@@ -386,7 +391,6 @@ class Session:
         store = StateStore(env, bundle.app)
         stored = store.load()
         state = stored.state
-        run.attempt = state.attempts.get(run.deployment_id or "", 0) + 1
         run.from_release = state.current.release if state.current else None
         run.final_release = run.from_release
         run.environment_status = state.status
@@ -491,19 +495,59 @@ class Session:
         self.run.record("VALIDATE", "immutability", result_text, cmd=cmd, detail=detail)
         return violations
 
+    # Desired state ---------------------------------------------------------------------------
+
+    def desired_state(self) -> Ending | None:
+        """NO_OP when the target is current, applying it would change nothing, and every
+        Deployment is rolled out. A current target that drifted or is unhealthy is redeployed."""
+        state, bundle = self.stored.state, self.bundle
+        current = state.current
+        if (
+            current is None
+            or current.release != bundle.name
+            or state.in_flight is not None
+            or state.status != Status.HEALTHY
+        ):
+            detail: Detail = {"target_is_current": False}
+            self.run.record("VALIDATE", "desired_state", "DEPLOY", detail=detail)
+            return None
+
+        manifests = workload_manifests(bundle.objects, bundle.app, self.request.target_fault)
+        drift = self.env.drift(manifests)
+        rollouts = []
+        for name in deployment_names(bundle.objects):
+            rollouts.append(rollout_status(self.env.get("deployment", name).json()))
+        healthy = all(status.complete for status in rollouts)
+        detail = {
+            "target_is_current": True,
+            "drift": list(drift.changed),
+            "rollout": [status.to_dict() for status in rollouts],
+        }
+        if drift.changed or not healthy:
+            self.run.drift_corrected = True
+            self.run.record("VALIDATE", "desired_state", "DRIFT", cmd=drift.cmds[0], detail=detail)
+            return None
+        self.run.record("VALIDATE", "desired_state", "NO_OP", cmd=drift.cmds[0], detail=detail)
+        return Ending(Outcome.NO_OP)
+
     # PREPARE --------------------------------------------------------------------------------
 
     def prepare(self) -> None:
         run, bundle, state = self.run, self.bundle, self.stored.state
-        run_id, attempt = run.deployment_id or "", run.attempt or 1
+        run_id = run.deployment_id or ""
+        attempt = state.attempts.get(run_id, 0) + 1
+        run.attempt = attempt
         target = ReleaseRef(bundle.name, bundle.version, bundle.image)
         started = iso_millis(self.ctl.clock())
         previous = state.last_known_good
         in_flight = InFlight(run_id, attempt, target, previous, "PREPARE", started)
+        current = state.current
         detail = {
             "target": bundle.name,
             "previous": previous.release if previous else None,
             "replaced_in_flight": state.in_flight.deployment_id if state.in_flight else None,
+            "downgrade": current is not None
+            and version_key(bundle.version) < version_key(current.version),
         }
         attempts = {**state.attempts, run_id: attempt}
         run.environment_status = Status.DEPLOYING
